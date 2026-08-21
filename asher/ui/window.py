@@ -82,6 +82,32 @@ def _require_qt() -> None:
         ) from _QT_IMPORT_ERROR
 
 
+_COMPANION_ACTIVE_STATES = frozenset({
+    AssistantState.WAKE_DETECTED,
+    AssistantState.AUTHENTICATING,
+    AssistantState.AUTHENTICATED,
+    AssistantState.LISTENING,
+    AssistantState.TRANSCRIBING,
+    AssistantState.THINKING,
+    AssistantState.AWAITING_CONFIRMATION,
+    AssistantState.EXECUTING,
+    AssistantState.OBSERVING,
+    AssistantState.SPEAKING,
+    AssistantState.SUCCESS,
+    AssistantState.ERROR,
+})
+
+
+def should_use_companion_mode(state: AssistantState, microphone_active: bool) -> bool:
+    """Return True only for an active voice interaction.
+
+    Text-only planning never forces the immersive scene. The companion scene is
+    a presentation mode layered on top of the same controller and safety policy.
+    """
+
+    return bool(microphone_active and state in _COMPANION_ACTIVE_STATES)
+
+
 if not QT_AVAILABLE:
 
     class AsherMainWindow:  # type: ignore[no-redef]
@@ -108,6 +134,13 @@ else:
     QLabel#orbState { color: #f4f7fb; font-size: 17pt; font-weight: 700; }
     QLabel#orbMessage { color: #aebdd1; font-size: 11pt; }
     QFrame#orbStage { background: #05070b; border: 1px solid #182233; border-radius: 22px; }
+    QWidget#companionMode { background: #020408; }
+    QFrame#companionHud { background: rgba(5, 10, 18, 210); border: 1px solid #15334a; border-radius: 14px; }
+    QLabel#companionBrand { color: #9eeaff; font-size: 16pt; font-weight: 700; letter-spacing: 2px; }
+    QLabel#companionState { color: #f4f7fb; font-size: 18pt; font-weight: 700; }
+    QLabel#companionMessage { color: #a7bfd0; font-size: 11pt; }
+    QLabel#companionTelemetry { color: #7fb9d0; font-size: 9pt; }
+    QFrame#companionConfirm { background: rgba(18, 21, 18, 225); border: 1px solid #9d742e; border-radius: 12px; }
     QLabel#statusChip { background: #1b3150; color: #bcd7f7; border-radius: 10px; padding: 5px 10px; }
     QLabel#warning { background: #4b3416; color: #ffd994; border: 1px solid #916721; border-radius: 8px; padding: 8px; }
     QLabel#danger { color: #ffb4b4; }
@@ -262,6 +295,100 @@ else:
         def refresh_settings(self, settings: DesktopSettings) -> None:
             profile = str(settings.voice_profile or "default").replace("_", " ")
             self.voice.setText(f"VOICE · {profile}")
+
+
+    class CompanionModePage(QWidget):
+        """Immersive voice-only scene shown during active conversation."""
+
+        def __init__(self, window: "AsherMainWindow") -> None:
+            super().__init__()
+            self.window = window
+            self.setObjectName("companionMode")
+            root = QVBoxLayout(self)
+            root.setContentsMargins(24, 18, 24, 22)
+            root.setSpacing(10)
+
+            top = QHBoxLayout()
+            top.addWidget(_label("ASHER", "companionBrand"))
+            top.addStretch()
+            self.telemetry = _label("LOCAL · VOICE · GUARDED", "companionTelemetry")
+            top.addWidget(self.telemetry)
+            stop = QPushButton("STOP")
+            stop.setObjectName("dangerButton")
+            stop.setMinimumWidth(92)
+            stop.clicked.connect(window.emergency_stop)
+            top.addWidget(stop)
+            root.addLayout(top)
+
+            root.addStretch(1)
+            self.orb = AsherOrbWidget(self)
+            self.orb.set_interactive_resize(True, initial_size=560)
+            root.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter)
+
+            self.state = _label("STANDBY", "companionState")
+            self.state.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            root.addWidget(self.state)
+            self.message = _label("Say “Hey Asher”", "companionMessage")
+            self.message.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            root.addWidget(self.message)
+            root.addSpacing(4)
+
+            self.confirm = QFrame()
+            self.confirm.setObjectName("companionConfirm")
+            confirm_layout = QVBoxLayout(self.confirm)
+            confirm_layout.setContentsMargins(14, 10, 14, 10)
+            self.confirm_summary = _label("", "companionMessage")
+            self.confirm_summary.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            confirm_layout.addWidget(self.confirm_summary)
+            actions = QHBoxLayout()
+            actions.addStretch()
+            reject = QPushButton("Reject")
+            reject.clicked.connect(window.reject_pending)
+            approve = QPushButton("Approve")
+            approve.setObjectName("primary")
+            approve.clicked.connect(window.approve_pending)
+            actions.addWidget(reject)
+            actions.addWidget(approve)
+            actions.addStretch()
+            confirm_layout.addLayout(actions)
+            self.confirm.setVisible(False)
+            root.addWidget(self.confirm)
+            root.addStretch(1)
+
+            hint = _label("Scroll over the sphere to resize · gesture control plugs into the same scale hook later", "companionTelemetry")
+            hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            root.addWidget(hint)
+
+        def set_state_event(self, event: Any) -> None:
+            state = getattr(event, "state", None)
+            if isinstance(state, AssistantState):
+                self.orb.set_state(state)
+                self.state.setText(state.value.upper().replace("_", " "))
+            message = str(getattr(event, "message", "") or "").strip()
+            if message:
+                self.message.setText(message)
+
+        def refresh_status(self, status: Any) -> None:
+            self.orb.set_state(status.state)
+            self.state.setText(status.state.value.upper().replace("_", " "))
+            self.message.setText(status.message or visual_for_state(status.state).label)
+            provider = "OFFLINE" if status.offline else ("HYBRID" if status.api_configured else "LOCAL")
+            mic = "MIC ACTIVE" if status.microphone_active else "MIC STANDBY"
+            self.telemetry.setText(f"{provider} · {mic}")
+
+        def refresh_settings(self, settings: DesktopSettings) -> None:
+            profile = str(settings.voice_profile or "default").replace("_", " ").upper()
+            self.telemetry.setToolTip(f"Voice profile: {profile}")
+
+        def refresh_pending(self, pending: PendingAction | None) -> None:
+            self.confirm.setVisible(pending is not None)
+            if pending is None:
+                self.confirm_summary.setText("")
+                return
+            self.confirm_summary.setText(
+                f"{pending.action} · {pending.target} · {pending.effect} · "
+                f"{pending.risk.name.replace('_', ' ')}"
+            )
 
 
     class ConversationPage(_Page):
@@ -618,13 +745,17 @@ else:
             self._timer.start(500)
 
         def _build_shell(self) -> None:
-            central = QWidget()
-            root = QHBoxLayout(central)
+            self.mode_stack = QStackedWidget()
+            self.setCentralWidget(self.mode_stack)
+
+            workspace = QWidget()
+            self.workspace = workspace
+            root = QHBoxLayout(workspace)
             root.setContentsMargins(0, 0, 0, 0)
             root.setSpacing(0)
-            self.setCentralWidget(central)
 
             sidebar = QFrame()
+            self.sidebar = sidebar
             sidebar.setObjectName("sidebar")
             sidebar.setFixedWidth(236)
             side = QVBoxLayout(sidebar)
@@ -648,6 +779,7 @@ else:
             right.setContentsMargins(0, 0, 0, 0)
             right.setSpacing(0)
             header = QFrame()
+            self.header = header
             header.setObjectName("header")
             header_layout = QHBoxLayout(header)
             header_layout.setContentsMargins(22, 14, 22, 14)
@@ -698,7 +830,23 @@ else:
                 self.stack.addWidget(page)
             right.addWidget(self.stack, 1)
             root.addLayout(right, 1)
+
+            self.companion_mode = CompanionModePage(self)
+            self.mode_stack.addWidget(workspace)
+            self.mode_stack.addWidget(self.companion_mode)
+            self.mode_stack.setCurrentWidget(workspace)
             self.select_page("Home")
+
+        def _set_companion_mode(self, enabled: bool) -> None:
+            target = self.companion_mode if enabled else self.workspace
+            if self.mode_stack.currentWidget() is target:
+                return
+            self.mode_stack.setCurrentWidget(target)
+
+        def _sync_mode_for_status(self, status: Any) -> None:
+            self._set_companion_mode(
+                should_use_companion_mode(status.state, bool(status.microphone_active))
+            )
 
         def select_page(self, name: str) -> None:
             page = self._pages.get(name)
@@ -733,6 +881,7 @@ else:
             """Apply real controller state on the Qt thread immediately."""
 
             self.home.set_state_event(event)
+            self.companion_mode.set_state_event(event)
             state = getattr(event, "state", None)
             if isinstance(state, AssistantState):
                 self.header_state.setText(state.value.upper().replace("_", " "))
@@ -740,6 +889,10 @@ else:
             message = str(getattr(event, "message", "") or "").strip()
             if message:
                 self.header_message.setText(message)
+            try:
+                self._sync_mode_for_status(self.controller.status())
+            except Exception:
+                pass
 
         def _refresh_status(self) -> None:
             try:
@@ -756,11 +909,15 @@ else:
             self.reset_stop_button.setVisible(status.emergency_stopped)
             self.emergency_stop_button.setEnabled(not status.emergency_stopped)
             self.home.refresh_status(status)
+            self.companion_mode.refresh_status(status)
+            self._sync_mode_for_status(status)
 
         def _refresh_views(self) -> None:
             try:
                 self.conversation_page.refresh(self.controller.conversation(), self.controller.live_steps())
-                self.confirmation_page.refresh(self.controller.pending_action())
+                pending = self.controller.pending_action()
+                self.confirmation_page.refresh(pending)
+                self.companion_mode.refresh_pending(pending)
                 self.memory_page.refresh(self.controller.list_memories())
                 self.users_page.refresh(self.controller.list_users())
                 self.permissions_page.refresh(self.controller.list_permissions())
@@ -768,6 +925,7 @@ else:
                 settings = self.controller.settings()
                 self.settings_page.load(settings)
                 self.home.refresh_settings(settings)
+                self.companion_mode.refresh_settings(settings)
             except Exception as error:
                 self._show_error(f"View refresh failed: {error}")
             self._refresh_status()
@@ -954,4 +1112,4 @@ else:
 
 AsherWindow = AsherMainWindow
 
-__all__ = ["AsherMainWindow", "AsherWindow", "QT_AVAILABLE"]
+__all__ = ["AsherMainWindow", "AsherWindow", "QT_AVAILABLE", "should_use_companion_mode"]

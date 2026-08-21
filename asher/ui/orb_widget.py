@@ -93,7 +93,7 @@ else:
         def __init__(self, parent: QWidget | None = None) -> None:
             super().__init__(parent)
             self.setMinimumSize(340, 340)
-            self.setMaximumSize(620, 620)
+            self.setMaximumSize(900, 900)
             self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
             self._state = AssistantState.STANDBY
             self._visual = visual_for_state(self._state)
@@ -101,6 +101,8 @@ else:
             self._audio_level = 0.0
             self._reduced_motion = False
             self._animation_intensity = 1.0
+            self._interactive_resize = False
+            self._display_size = 560
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._advance)
             self._sync_timer()
@@ -136,6 +138,42 @@ else:
             self._animation_intensity = max(0.0, min(1.0, float(intensity)))
             self._sync_timer()
             self.update()
+
+        def set_interactive_resize(self, enabled: bool, *, initial_size: int | None = None) -> None:
+            """Enable presentation-only resizing without changing assistant state.
+
+            The same bounded ``set_display_size`` hook can later be driven by a
+            webcam hand-gesture adapter. This milestone only wires desktop
+            wheel input so the interaction can be tested without claiming hand
+            tracking is already implemented.
+            """
+
+            self._interactive_resize = bool(enabled)
+            if initial_size is not None:
+                self.set_display_size(initial_size)
+            elif not enabled:
+                self.setMinimumSize(340, 340)
+                self.setMaximumSize(900, 900)
+
+        def set_display_size(self, size: int) -> int:
+            """Set a bounded square display size and return the applied value."""
+
+            applied = max(340, min(900, int(size)))
+            self._display_size = applied
+            self.setFixedSize(applied, applied)
+            return applied
+
+        def wheelEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback
+            if not self._interactive_resize:
+                super().wheelEvent(event)
+                return
+            delta = event.angleDelta().y()
+            if delta:
+                step = 28 if delta > 0 else -28
+                self.set_display_size(self._display_size + step)
+                event.accept()
+                return
+            super().wheelEvent(event)
 
         def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback
             super().showEvent(event)

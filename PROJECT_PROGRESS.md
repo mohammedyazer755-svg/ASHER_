@@ -1,6 +1,45 @@
 # ASHER Project Progress
 
 
+## Continuation update — Cinematic UI Phase UI-3A: dual-mode companion foundation (2026-08-21)
+
+### Verified before UI-3A
+
+- UI-1 is committed on `feature/cinematic-ui` as `e28a530`.
+- UI-2 state-driven orb prototype was verified on the owner's Windows machine with **88 tests passed, 0 failed** and the legacy offline voice-accuracy smoke passing.
+- The UI-2 visual result was intentionally rejected as the final Home design because the orb was embedded inside the permanent dashboard rather than becoming a dedicated immersive conversation scene.
+
+### Implemented in UI-3A
+
+- Split the desktop experience into two presentation modes without duplicating the assistant process:
+  - **Workspace mode** preserves the current sidebar, history/conversation, confirmation, memory, VoiceGuard/users, permissions, activity, settings and diagnostics views.
+  - **Companion mode** is a separate edge-to-edge dark scene used only during an active voice interaction.
+- Added `should_use_companion_mode(state, microphone_active)` so text-only planning or idle wake monitoring does not force the immersive scene. The mode follows real controller state plus microphone activity rather than a fake timer.
+- Added an immersive Companion view with a large state-driven orb, minimal telemetry, persistent emergency stop and an in-scene confirmation strip for pending consequential actions.
+- Kept the existing Home/dashboard intact as the normal management surface.
+- Added bounded orb display scaling (`340..900 px`) and desktop wheel resizing. The scaling hook is presentation-only and can later be driven by a webcam hand-gesture adapter; **actual hand tracking is not claimed implemented in UI-3A**.
+- The same canonical state events update both Workspace Home and Companion mode. No second controller, planner, memory store or safety path was created.
+- Added regression coverage for voice-only mode gating, workspace/companion separation and the bounded external orb-scale hook.
+
+### Honest limitations after UI-3A
+
+- The immersive orb still uses the UI-2 procedural ring/glow renderer. The reel-inspired plasma/electric filament renderer is the next visual milestone, not yet implemented.
+- Real webcam hand tracking/pinch resizing is not yet implemented. UI-3A only establishes the safe bounded scale interface and mouse-wheel test path.
+- Live microphone/TTS amplitude is not yet connected to the orb.
+- Transition animation between Workspace and Companion modes is functional but not yet visually polished.
+- Performance/latency measurements for the immersive mode are still pending.
+
+### Required verification before committing UI-3A
+
+Run `./run_tests.ps1` on the owner's Windows machine. Then launch `./run_asher.ps1 -Mode ui` and verify the normal Workspace still opens unchanged. Live voice mode should be tested only after the deterministic suite is green.
+
+### Exact next action
+
+After UI-3A is green and committed, implement UI-3B: the reel-inspired original plasma sphere/HUD renderer inside Companion mode, then wire live amplitude. Webcam hand-gesture resizing remains a later bounded input adapter after the visual/desktop interaction is stable.
+
+---
+
+
 ## Continuation update — Cinematic UI Phase UI-2: procedural state-driven orb (2026-08-21)
 
 ### Verified before UI-2
