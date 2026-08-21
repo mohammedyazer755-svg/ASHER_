@@ -27,11 +27,12 @@ from asher.ui.controller import (
     PermissionRecord,
     UserRecord,
 )
+from asher.ui.orb_widget import AsherOrbWidget, visual_for_state
 from asher.ui.workers import FunctionWorker, QT_WORKERS_AVAILABLE
 
 
 try:
-    from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QPropertyAnimation, QThreadPool, QTimer, Qt
+    from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QObject, QPropertyAnimation, QThreadPool, QTimer, Qt, Signal
     from PySide6.QtGui import QColor, QFont, QIcon, QPalette
     from PySide6.QtWidgets import (
         QApplication,
@@ -104,6 +105,9 @@ else:
     QLabel#pageTitle { color: #f5f8fc; font-size: 19pt; font-weight: 700; }
     QLabel#subtitle, QLabel#muted { color: #91a6c3; }
     QLabel#state { color: #a7f3d0; font-size: 12pt; font-weight: 700; }
+    QLabel#orbState { color: #f4f7fb; font-size: 17pt; font-weight: 700; }
+    QLabel#orbMessage { color: #aebdd1; font-size: 11pt; }
+    QFrame#orbStage { background: #05070b; border: 1px solid #182233; border-radius: 22px; }
     QLabel#statusChip { background: #1b3150; color: #bcd7f7; border-radius: 10px; padding: 5px 10px; }
     QLabel#warning { background: #4b3416; color: #ffd994; border: 1px solid #916721; border-radius: 8px; padding: 8px; }
     QLabel#danger { color: #ffb4b4; }
@@ -176,52 +180,88 @@ else:
             return frame, layout
 
 
+    class _StateSignalBridge(QObject):
+        state_event = Signal(object)
+
+
     class HomePage(_Page):
         def __init__(self, window: "AsherMainWindow") -> None:
-            super().__init__("Welcome back", "A calm local-first companion. Use text input while the microphone adapter is being configured.")
+            super().__init__("ASHER", "Authenticated companion · local-first · controlled tools")
             self.window = window
-            card, layout = self.add_card()
-            state_row = QHBoxLayout()
-            self.state = _label("STANDBY", "state")
-            self.state.setMinimumHeight(36)
-            state_row.addWidget(self.state)
-            state_row.addStretch()
+
+            stage = QFrame()
+            stage.setObjectName("orbStage")
+            stage_layout = QVBoxLayout(stage)
+            stage_layout.setContentsMargins(24, 18, 24, 22)
+            stage_layout.setSpacing(7)
+            stage_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.orb = AsherOrbWidget(stage)
+            stage_layout.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter)
+            self.state = _label("STANDBY", "orbState")
+            self.state.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            stage_layout.addWidget(self.state)
+            self.status = _label("Say “Hey Asher”", "orbMessage")
+            self.status.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            stage_layout.addWidget(self.status)
+            self.body.addWidget(stage, 1)
+
+            controls = QHBoxLayout()
+            self.mic = _label("MIC · standby", "statusChip")
+            self.voice = _label("VOICE · loading", "statusChip")
+            self.provider = _label("PROVIDER · local", "statusChip")
+            controls.addWidget(self.mic)
+            controls.addWidget(self.voice)
+            controls.addWidget(self.provider)
+            controls.addStretch()
             self.listen_button = QPushButton("Start listening")
             self.listen_button.setObjectName("primary")
             self.listen_button.clicked.connect(window.toggle_listening)
-            state_row.addWidget(self.listen_button)
-            layout.addLayout(state_row)
-            self.status = _label("Ready for Hey Asher", "muted")
-            layout.addWidget(self.status)
+            controls.addWidget(self.listen_button)
+            self.body.addLayout(controls)
 
-            input_card, input_layout = self.add_card("Text fallback")
-            row = QHBoxLayout()
+            input_row = QHBoxLayout()
             self.input = QLineEdit()
-            self.input.setPlaceholderText("Type a request for Asher…")
+            self.input.setPlaceholderText("Type to Asher…")
             self.input.returnPressed.connect(window.submit_text)
-            row.addWidget(self.input, 1)
+            input_row.addWidget(self.input, 1)
             send = QPushButton("Send")
             send.setObjectName("primary")
             send.clicked.connect(window.submit_text)
-            row.addWidget(send)
-            input_layout.addLayout(row)
-            self.last_reply = _label("No request submitted yet.", "muted")
-            input_layout.addWidget(self.last_reply)
+            input_row.addWidget(send)
+            self.body.addLayout(input_row)
+            self.last_reply = _label("", "muted")
+            self.last_reply.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            self.body.addWidget(self.last_reply)
 
-            status_card, status_layout = self.add_card("Runtime status")
-            self.offline = _label("Offline mode: checking…", "statusChip")
-            self.api = _label("API: checking…", "statusChip")
-            status_layout.addWidget(self.offline)
-            status_layout.addWidget(self.api)
-            disclosure = _label("Online speech is AI-generated; the offline Windows voice stays available.", "muted")
-            status_layout.addWidget(disclosure)
+            # Backward-compatible attributes used by older code/tests.
+            self.offline = self.provider
+            self.api = self.provider
+
+        def set_state_event(self, event: Any) -> None:
+            state = getattr(event, "state", None)
+            if isinstance(state, AssistantState):
+                self.orb.set_state(state)
+                self.state.setText(state.value.upper().replace("_", " "))
+                message = str(getattr(event, "message", "") or "").strip()
+                if message:
+                    self.status.setText(message)
 
         def refresh_status(self, status: Any) -> None:
+            self.orb.set_state(status.state)
             self.state.setText(status.state.value.upper().replace("_", " "))
-            self.status.setText(status.message)
+            self.status.setText(status.message or visual_for_state(status.state).label)
             self.listen_button.setText("Stop listening" if status.microphone_active else "Start listening")
-            self.offline.setText("Offline mode: ON" if status.offline else "Offline mode: available fallback")
-            self.api.setText("API: configured" if status.api_configured else "API: not configured")
+            self.mic.setText("MIC · active" if status.microphone_active else "MIC · standby")
+            if status.offline:
+                self.provider.setText("PROVIDER · local / offline")
+            elif status.api_configured:
+                self.provider.setText("PROVIDER · local + API")
+            else:
+                self.provider.setText("PROVIDER · local")
+
+        def refresh_settings(self, settings: DesktopSettings) -> None:
+            profile = str(settings.voice_profile or "default").replace("_", " ")
+            self.voice.setText(f"VOICE · {profile}")
 
 
     class ConversationPage(_Page):
@@ -561,11 +601,17 @@ else:
             self._workers: set[FunctionWorker] = set()
             self._nav_buttons: list[QPushButton] = []
             self._pages: dict[str, QWidget] = {}
+            self._state_unsubscribe: Callable[[], None] | None = None
+            self._state_bridge = _StateSignalBridge(self)
+            self._state_bridge.state_event.connect(self._on_state_event)
             self.setWindowTitle("Asher — authenticated personal companion")
             self.setMinimumSize(1120, 720)
             self.resize(1320, 820)
             self.setStyleSheet(APP_STYLE)
             self._build_shell()
+            subscribe = getattr(self.controller, "subscribe_state", None)
+            if callable(subscribe):
+                self._state_unsubscribe = subscribe(self._state_bridge.state_event.emit)
             self._refresh_views()
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._refresh_status)
@@ -683,6 +729,18 @@ else:
             self.header_state.setText("ERROR")
             self.header_state.setStyleSheet("color: #ffb4b4;")
 
+        def _on_state_event(self, event: Any) -> None:
+            """Apply real controller state on the Qt thread immediately."""
+
+            self.home.set_state_event(event)
+            state = getattr(event, "state", None)
+            if isinstance(state, AssistantState):
+                self.header_state.setText(state.value.upper().replace("_", " "))
+                self.header_state.setStyleSheet("color: #ffb4b4;" if state == AssistantState.ERROR else "")
+            message = str(getattr(event, "message", "") or "").strip()
+            if message:
+                self.header_message.setText(message)
+
         def _refresh_status(self) -> None:
             try:
                 status = self.controller.status()
@@ -707,7 +765,9 @@ else:
                 self.users_page.refresh(self.controller.list_users())
                 self.permissions_page.refresh(self.controller.list_permissions())
                 self.activity_page.refresh(self.controller.audit_records())
-                self.settings_page.load(self.controller.settings())
+                settings = self.controller.settings()
+                self.settings_page.load(settings)
+                self.home.refresh_settings(settings)
             except Exception as error:
                 self._show_error(f"View refresh failed: {error}")
             self._refresh_status()
@@ -880,6 +940,9 @@ else:
 
         def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback name
             self._timer.stop()
+            if self._state_unsubscribe is not None:
+                self._state_unsubscribe()
+                self._state_unsubscribe = None
             close = getattr(self.controller, "close", None)
             if callable(close):
                 close()

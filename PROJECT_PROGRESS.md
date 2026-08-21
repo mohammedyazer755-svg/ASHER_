@@ -1,5 +1,43 @@
 # ASHER Project Progress
 
+
+## Continuation update — Cinematic UI Phase UI-2: procedural state-driven orb (2026-08-21)
+
+### Verified before UI-2
+
+- UI-1 committed on `feature/cinematic-ui` as `e28a530` (`UI-1 truthful cinematic state bridge`).
+- Owner's Windows machine ran the complete suite after UI-1: **85 tests passed, 0 failed**.
+- Deterministic legacy voice-accuracy smoke test also passed.
+
+### Implemented in UI-2
+
+- Added `asher/ui/orb_widget.py`: an original procedural PySide6/QPainter companion orb with bounded glow, arcs, particles and a radial core. No downloaded/copyrighted orb assets are used.
+- Orb visuals map directly to the canonical `AssistantState`; the animation timer changes visual phase only and cannot advance ASHER state or fake success.
+- Added distinct palettes/motion for standby, wake, authentication, listening, transcription, thinking, confirmation, execution, observation, speaking, success, error, offline, stopped and locked states, while keeping legacy fallback states renderable.
+- Added a short-lived normalized `set_audio_level()` presentation hook without persisting raw audio. Real microphone/TTS level wiring remains a later milestone and is not claimed implemented.
+- Animation is bounded, slows during low-activity states, and stops when hidden. Reduced-motion/intensity hooks are present for later settings integration.
+- Reworked the Home view around the real orb while preserving text input, microphone toggle, provider status, voice profile status, sidebar navigation, emergency stop and all existing companion panels.
+- Connected the existing canonical state subscription to Qt through a queued Signal bridge so state changes can update the orb immediately without touching Qt widgets from worker/voice threads. Polling remains as a safe status fallback.
+- Added `tests/test_orb_widget.py` covering complete state-to-visual mapping, stopped/locked particle suppression, and optional offscreen Qt rendering across real states.
+
+### Honest limitations after UI-2
+
+- Audio-reactive animation is **PARTIAL**: the widget accepts a normalized level, but the current voice runtime does not yet publish live level events to the UI.
+- Authentication/user-role identity is not yet surfaced in the minimalist Home status row. The existing security controller remains authoritative and unchanged.
+- Conversation/memory/security/activity/settings panels retain the existing functional dashboard styling; cinematic panel redesign is a later companion-panel milestone.
+- Reduced-motion and animation-intensity setters exist in the orb, but Settings is not yet connected to them.
+- Performance/latency measurements for the cinematic UI have not yet been recorded.
+
+### Required verification before committing UI-2
+
+Run `./run_tests.ps1` on the owner's Windows machine. UI-2 is not complete until the complete deterministic suite and legacy voice smoke tests remain green and the offscreen Qt orb test passes when PySide6 is available. Then launch the desktop UI and visually confirm the orb renders without freezing the interface.
+
+### Exact next action
+
+After UI-2 is green and committed, wire safe live amplitude/state-detail signals for LISTENING/SPEAKING, surface authenticated role/provider/voice status truthfully, and add the confirmation surface around the orb without weakening the existing policy or emergency-stop path.
+
+---
+
 ## Continuation update — Cinematic UI Phase UI-1: truthful state/event bridge (2026-08-21)
 
 ### Owner baseline before this change
