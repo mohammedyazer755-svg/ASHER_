@@ -1,0 +1,4 @@
+python-dotenv>=1.0
+requests>=2.31
+numpy>=1.26
+send2trash>=1.8

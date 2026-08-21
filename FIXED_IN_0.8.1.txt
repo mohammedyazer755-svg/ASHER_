@@ -1,0 +1,14 @@
+ASHER v0.8.1 CONFIRMATION FIX
+
+Fixed the exact issue shown in the terminal log:
+Whisper returned 'send it.' but brain.py compared only against 'send it'.
+
+Asher now ignores trailing sentence punctuation for control commands, including:
+- send it.
+- don't send it!
+- lock it?
+- go to sleep.
+- goodbye.
+
+Internal punctuation in WhatsApp message text is preserved.
+The Qwen planner and its action schema were not changed.

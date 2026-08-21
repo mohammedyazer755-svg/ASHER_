@@ -1,0 +1,4 @@
+# Install the small, deterministic core first. Optional hardware/model/UI
+# packages are listed separately so setup can continue on a minimal machine.
+-r requirements-core.txt
+-r requirements-optional.txt

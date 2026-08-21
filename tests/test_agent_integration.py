@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from asher.agent.controller import CompanionController
+from asher.brain.deterministic import ContactResolver, DeterministicPlanner
+from asher.config import AsherConfig
+from asher.types import AuthMethod
+
+
+class AgentIntegrationTests(unittest.TestCase):
+    def _controller(self, directory: str) -> CompanionController:
+        return CompanionController(
+            AsherConfig.load(directory),
+            contact_resolver=ContactResolver(
+                ("Avery Stone", "Sam Lee"),
+                {"avery": "Avery Stone", "sam": "Sam Lee"},
+            ),
+        )
+
+    def test_common_tools_are_dry_run_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            session = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            opened = controller.handle_text("open chrome", session)
+            closed = controller.handle_text("close chrome", session)
+            self.assertIn("complete", {item.status for item in opened.updates})
+            self.assertIn("complete", {item.status for item in closed.updates})
+
+    def test_search_variants_and_ambiguous_contact_are_safe(self) -> None:
+        planner = DeterministicPlanner(
+            ContactResolver(("Sara", "Sarah"), {"sara": "Sara", "sarah": "Sarah"})
+        )
+        self.assertEqual(planner.plan("search Sara").steps[0].call.arguments["contact"], "Sara")
+        self.assertEqual(planner.plan("search S A R A").steps[0].call.arguments["contact"], "Sara")
+        self.assertIn("Which contact", planner.plan("search Sarra").response)
+        self.assertEqual(
+            planner.plan("search cats").steps[0].call.tool_name,
+            "browser.search",
+        )
+
+    def test_compound_and_indirect_message_requires_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            session = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            compound = controller.handle_text("open chrome and search cats", session)
+            self.assertEqual(
+                [item.result.tool_name for item in compound.updates if item.result is not None],
+                ["app.open", "browser.search"],
+            )
+            reply = controller.handle_text(
+                "ask Sam Lee whether he is ready to hang out",
+                session,
+            )
+            self.assertIsNotNone(reply.confirmation_id)
+            self.assertIn("exact local preview", reply.text)
+            approved = controller.approve(reply.confirmation_id, session)
+            self.assertIn("complete", {item.status for item in approved.updates})
+            self.assertIsNone(controller.loop.active)
+
+    def test_guest_cannot_use_private_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            guest = controller.create_guest_session()
+            reply = controller.handle_text("open chrome", guest)
+            self.assertTrue(any(item.status in {"failed", "denied"} for item in reply.updates))
+            self.assertIsNone(controller.loop.active)
+
+    def test_failed_confirmation_approval_does_not_orphan_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            session = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            reply = controller.handle_text("send hello to Sam Lee", session)
+            self.assertIsNotNone(reply.confirmation_id)
+            wrong = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            denied = controller.approve(reply.confirmation_id, wrong)
+            self.assertTrue(any(item.status == "denied" for item in denied.updates))
+            self.assertIsNotNone(controller.loop.active)
+            self.assertEqual(controller.loop.active.waiting_confirmation_id, reply.confirmation_id)
+            self.assertTrue(controller.reject(reply.confirmation_id, session).updates)
+
+    def test_pronoun_continuation_context_cannot_cross_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            first = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            prepared = controller.handle_text("send hello to Sam Lee", first)
+            self.assertIsNotNone(prepared.confirmation_id)
+            controller.reject(prepared.confirmation_id, first)
+
+            second = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            isolated = controller.handle_text("send hello to her", second)
+            self.assertIsNone(isolated.confirmation_id)
+            self.assertIn("recipient", isolated.text.casefold())
+
+            continued = controller.handle_text("send hello to her", first)
+            self.assertIsNotNone(continued.confirmation_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

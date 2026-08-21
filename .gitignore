@@ -1,0 +1,69 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# VS Code settings
+.vscode/
+
+# Personal memory and conversation data
+memory.json
+history.json
+data/voice_contacts.json
+data/asher.db
+data/*.db-*
+asher.db
+asher.db-*
+.asher/
+
+# Private recordings, trained models, and evaluation artifacts
+recordings/
+models/
+artifacts/
+evaluation/private/
+evaluations/
+*.wav
+*.flac
+*.mp3
+*.onnx
+*.pt
+*.pth
+*.pkl
+*.joblib
+
+# Local audit/runtime output
+audit*.jsonl
+logs/
+screenshots/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build output
+build/
+dist/
+*.egg-info/
+.gradle/
+android/.gradle/
+android/local.properties
+android/**/build/
+
+# OS files
+.DS_Store
+Thumbs.db

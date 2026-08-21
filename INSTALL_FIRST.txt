@@ -1,0 +1,39 @@
+ASHER v0.8.1 VOICE ACCURACY UPGRADE
+
+This ZIP intentionally does NOT include your private .env, memory.json,
+history.json, .git folder, or cache files. Extracting it over D:\VOICE AI keeps
+those existing personal files unchanged.
+
+INSTALL
+1. Close Asher and VS Code.
+2. Make a backup copy of D:\VOICE AI.
+3. Extract this ZIP to D:\ (choose D:\, not D:\VOICE AI).
+4. Select Replace the files in the destination when Windows asks.
+5. Open D:\VOICE AI in VS Code.
+6. Keep your existing CUDA-enabled PyTorch installation.
+7. Run: python -m pip install -r requirements.txt
+8. Run: python verify_upgrade.py
+9. Run: python voice_diagnostics.py
+10. To test speech: python voice_diagnostics.py --test
+11. Run: python main.py
+
+VOICE TESTS
+- Hey Asher
+- open WhatsApp
+- search Tharika
+- search T H A R I K A
+- search tee aitch ay ar eye kay ay
+- send hi to Tharika
+- send it
+- open Chrome and then close Chrome
+
+ADDING CONTACTS
+Edit: D:\VOICE AI\data\voice_contacts.json
+Add the correct contact name under "contacts" and any common mishearings under
+"aliases". Restart Asher after editing the file.
+
+MICROPHONE SELECTION
+Run: python voice_diagnostics.py
+Choose the correct index and add it to your existing .env:
+ASHER_MIC_INDEX=2
+Restart Asher.

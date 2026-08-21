@@ -1,0 +1,27 @@
+# Desktop UI and provider adapters
+PySide6>=6.7
+openai>=1.50
+ollama>=0.4
+
+# Local speech input/transcription (large model downloads happen only on use)
+sounddevice>=0.5
+faster-whisper>=1.1
+openwakeword>=0.6
+
+# VoiceGuard student-trained classifier head
+scikit-learn>=1.5
+
+# Windows application/WhatsApp adapters and compatibility voices
+pyautogui>=0.9
+pyperclip>=1.9
+pywinauto>=0.6
+comtypes>=1.4
+winrt-Windows.Security.Credentials.UI>=3.2
+pyttsx3>=2.90
+SpeechRecognition>=3.10
+
+# Android companion protocol reference tests
+cryptography>=42
+
+# Development convenience
+pytest>=8.0

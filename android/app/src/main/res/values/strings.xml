@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ASHER Companion</string>
+    <string name="pairing_title">Pair with ASHER on this PC</string>
+    <string name="pairing_description">Pairing creates a private encrypted channel. Check the words or code on both devices before accepting.</string>
+    <string name="pair_button">Start secure pairing</string>
+    <string name="authenticate_button">Test protected action</string>
+    <string name="status_unpaired">Not paired</string>
+</resources>

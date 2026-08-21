@@ -1,0 +1,26 @@
+{
+  "notepad": [
+    "notepad.exe"
+  ],
+  "calculator": [
+    "calc.exe"
+  ],
+  "chrome": [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "--profile-directory=Default"
+  ],
+  "personal chrome": [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "--profile-directory=Default"
+  ],
+  "chrome personal": [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "--profile-directory=Default"
+  ],
+  "vscode": [
+    "C:\\Users\\Mohammed yazer\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe"
+  ],
+  "visual studio code": [
+    "C:\\Users\\Mohammed yazer\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe"
+  ]
+}
