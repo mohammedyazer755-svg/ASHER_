@@ -308,3 +308,21 @@ device verification remain external work. Real owner voice samples, a working
 microphone, optional model downloads, Ollama's Qwen model, an OpenAI key, and
 Windows Hello are intentionally not fabricated. See `PROJECT_PROGRESS.md` for
 the exact evidence and next actions.
+
+## VoiceGuard real-data collection
+
+Use the guided collector for real speaker-auth sessions. It keeps raw audio in ASHER's private runtime directory; do not copy those WAV files into the project or upload them.
+
+Owner session (the script resolves the real persistent owner user ID automatically):
+
+```powershell
+python voiceguard_collect.py --speaker owner --environment quiet_room --samples 6 --consent
+```
+
+A consented non-owner/negative speaker can be collected into the dataset-only `unknown_pool` class:
+
+```powershell
+python voiceguard_collect.py --speaker unknown --speaker-id unknown_pool --environment quiet_room --samples 6 --consent
+```
+
+Each invocation is one recording session. Record across multiple sessions/times/environments so train, validation and test remain session-separated. Never treat VoiceGuard as sufficient authorization for high-risk actions.
