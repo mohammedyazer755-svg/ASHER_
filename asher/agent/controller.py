@@ -13,6 +13,7 @@ from asher.brain.plans import as_execution_plan
 from asher.brain.providers import HybridPlanner, OllamaProvider, OpenAIResponsesProvider
 from asher.config import AsherConfig
 from asher.core.cancellation import EmergencyStop
+from asher.core.state import AssistantState
 from asher.core.redaction import contains_prohibited_secret, redact_text
 from asher.memory.retrieval import MemoryRetriever
 from asher.memory.store import MemoryStore
@@ -143,6 +144,11 @@ class CompanionController:
             return CompanionReply("Cancelled.", updates)
         active_session = self._resolve_session(session)
         if active_session is None:
+            self.loop.states.transition(
+                AssistantState.LOCKED,
+                "Authentication required",
+                reason="session_invalid_or_expired",
+            )
             return CompanionReply(
                 "Your authenticated session has expired or is no longer valid. Please authenticate again.",
                 offline=self.planner.offline,
@@ -161,6 +167,11 @@ class CompanionController:
         if last_app and any(token in lowered for token in ("it", "that window", "same app", "close it")):
             context["last_app"] = last_app
         self.working_memory.append(session.session_id, "user", redact_text(text))
+        self.loop.states.transition(
+            AssistantState.THINKING,
+            "Understanding and planning the request",
+            actor_id=session.actor.user_id,
+        )
         plan = self.planner.plan(text, context=context)
         emotional = infer_emotional_context(text)
         if emotional is not None and not plan.steps and plan.response:
@@ -171,9 +182,22 @@ class CompanionController:
                 "urgent": "I hear the urgency. I’ll start with the fastest safe option.",
             }.get(emotional.cue, plan.response)
             self.working_memory.append(session.session_id, "assistant", redact_text(response))
+            self.loop.states.transition(
+                AssistantState.SUCCESS,
+                "Response ready",
+                provider=plan.provider,
+                offline=plan.offline,
+            )
             return CompanionReply(response, offline=plan.offline, provider=plan.provider)
         if not plan.steps:
-            return CompanionReply(plan.response or "I’m not sure how to help with that yet.", offline=plan.offline, provider=plan.provider)
+            response = plan.response or "I’m not sure how to help with that yet."
+            self.loop.states.transition(
+                AssistantState.SUCCESS,
+                "Response ready",
+                provider=plan.provider,
+                offline=plan.offline,
+            )
+            return CompanionReply(response, offline=plan.offline, provider=plan.provider)
         updates = tuple(self.loop.start(as_execution_plan(plan), session, dry_run=self.config.dry_run))
         self._update_context(updates, session)
         confirmation_id = next((item.confirmation_id for item in updates if item.confirmation_id), None)

@@ -16,6 +16,7 @@ from typing import Any, Callable, Protocol
 from asher.agent.controller import CompanionController, CompanionReply
 from asher.config import AsherConfig
 from asher.core.cancellation import CancellationToken, CancelledError
+from asher.core.state import AssistantState, StateStore
 from asher.voice.capture import AudioFrame, TurnCapture, VadConfig
 from asher.voice.pipeline import PipelineStatus, VoiceAccuracyPipeline
 from asher.voice.transcription import FasterWhisperTranscriber, TranscriptionConfig
@@ -273,6 +274,8 @@ class VoiceRuntime:
             tts = build_default_tts(selected_profile=self.config.voice_profile)
         self.tts = tts
         self.on_event = on_event or (lambda event: None)
+        loop = getattr(controller, "loop", None)
+        self.states = getattr(loop, "states", None) or StateStore()
         self._stop = CancellationToken()
 
     def stop(self) -> None:
@@ -297,11 +300,15 @@ class VoiceRuntime:
             active_until = 0.0
             while not self._stop.cancelled:
                 active = active_session is not None and self._clock() < active_until
-                if not active:
+                if self._tts_is_speaking():
+                    self._transition(AssistantState.SPEAKING, "Speaking")
+                elif not active:
                     active_session = None
                     active_until = 0.0
+                    self._transition(AssistantState.STANDBY, "Standby: listening for Hey Asher")
                     self._emit("standby", "Standby: listening for Hey Asher")
                 else:
+                    self._transition(AssistantState.LISTENING, "Listening for your command")
                     self._emit("listening", "Listening for your command")
 
                 turn = self._capture_trigger(
@@ -312,6 +319,7 @@ class VoiceRuntime:
                     if active and not self._stop.cancelled:
                         active_session = None
                         active_until = 0.0
+                        self._transition(AssistantState.STANDBY, "Active listening timed out. Say Hey Asher when you need me.")
                         self._emit("standby", "Active listening timed out. Say Hey Asher when you need me.")
                     continue
                 if not turn.pcm16:
@@ -323,6 +331,8 @@ class VoiceRuntime:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
                     turn_path = Path(temporary.name)
                 try:
+                    self._transition(AssistantState.TRANSCRIBING, "Understanding speech")
+                    self._emit("transcribing", "Understanding speech")
                     _write_wav(turn_path, turn.pcm16, turn.sample_rate)
                     result = self.pipeline.process(
                         turn_path,
@@ -343,7 +353,12 @@ class VoiceRuntime:
                 wake = self.wake_detector.detect(heard)
                 if active_session is None:
                     if not wake.detected:
+                        self._transition(AssistantState.STANDBY, "Wake phrase not detected")
                         continue
+                    self._transition(AssistantState.WAKE_DETECTED, "Hey Asher detected")
+                    self._emit("wake_detected", "Hey Asher detected", result.transcript)
+                    self._transition(AssistantState.AUTHENTICATING, "Verifying speaker")
+                    self._emit("authenticating", "Verifying speaker", result.transcript)
                     owner_id = None
                     score = None
                     reason = "VoiceGuard not enrolled; guest session"
@@ -352,9 +367,20 @@ class VoiceRuntime:
                     actor = self.controller.users.get(owner_id) if owner_id else None
                     if actor is not None and actor.role.value in {"owner", "trusted"}:
                         active_session = self.controller.create_voice_session(actor)
+                        self._transition(
+                            AssistantState.AUTHENTICATED,
+                            "Speaker authenticated",
+                            actor_id=getattr(actor, "user_id", None),
+                            confidence=score,
+                        )
                         self._emit("authenticated", reason, result.transcript, confidence=score)
                     else:
                         active_session = self.controller.create_guest_session()
+                        self._transition(
+                            AssistantState.LOCKED,
+                            "Private actions locked; guest conversation only",
+                            confidence=score,
+                        )
                         self._emit("guest", "Wake phrase heard, but speaker authentication did not grant private access.", result.transcript, confidence=score)
                     active_until = self._clock() + self.active_window_seconds
                     command = wake.command
@@ -365,18 +391,24 @@ class VoiceRuntime:
                     command = wake.command if wake.detected else heard
 
                 if not command:
+                    self._transition(AssistantState.LISTENING, "Listening for your command")
                     self._emit("listening", "Yes?", result.transcript)
-                    self._speak("Yes?")
+                    self._speak("Yes?", return_state=AssistantState.LISTENING)
                     continue
                 if command.casefold().strip().rstrip(".,!?;:") in SLEEP_COMMANDS:
                     active_session = None
                     active_until = 0.0
                     self._emit("standby", "Going back to standby.", result.transcript)
-                    self._speak("Going back to standby.")
+                    self._speak("Going back to standby.", return_state=AssistantState.STANDBY)
                     continue
                 reply = self.controller.handle_text(command, active_session)
                 self._emit("reply", reply.text, result.transcript, reply=reply)
-                self._speak(reply.text)
+                speech_return_state = (
+                    AssistantState.AWAITING_CONFIRMATION
+                    if reply.confirmation_id
+                    else AssistantState.LISTENING
+                )
+                self._speak(reply.text, return_state=speech_return_state)
                 active_until = self._clock() + self.active_window_seconds
                 if reply.confirmation_id:
                     self._emit("confirmation", "Open the desktop confirmation panel to approve this action.", result.transcript, reply=reply)
@@ -419,15 +451,81 @@ class VoiceRuntime:
             return capture.capture(remaining_frames(), cancellation=self._stop)
         raise CancelledError(self._stop.reason)
 
-    def _speak(self, text: str) -> None:
+    def _speak(
+        self,
+        text: str,
+        *,
+        return_state: AssistantState = AssistantState.LISTENING,
+    ) -> None:
         clean = str(text).strip()
         if not clean or self._stop.cancelled:
             return
+        self._transition(
+            AssistantState.SPEAKING,
+            "Speaking",
+            voice_profile=getattr(self.tts, "selected_profile_name", None),
+        )
+        self._emit("speaking", clean)
         try:
-            self.tts.speak_async(clean, interrupt=True)
+            handle = self.tts.speak_async(clean, interrupt=True)
         except Exception as error:
             # Speech failure must not discard the text reply or stop listening.
+            self._transition(
+                AssistantState.ERROR,
+                "Speech output unavailable",
+                error=type(error).__name__,
+            )
             self._emit("speech_error", f"Speech output unavailable: {type(error).__name__}")
+            return
+
+        wait = getattr(handle, "wait", None)
+        if callable(wait):
+            watcher = threading.Thread(
+                target=self._watch_speech,
+                args=(handle, return_state),
+                name="asher-tts-state",
+                daemon=True,
+            )
+            watcher.start()
+        else:
+            # Lightweight test/fallback providers may not return a waitable
+            # handle. The next real runtime event will advance the state.
+            self._transition(return_state, "Ready")
+
+    def _watch_speech(self, handle: Any, return_state: AssistantState) -> None:
+        try:
+            result = handle.wait()
+        except Exception as error:
+            self._transition(
+                AssistantState.ERROR,
+                "Speech output failed",
+                error=type(error).__name__,
+            )
+            self._emit("speech_error", f"Speech output unavailable: {type(error).__name__}")
+            return
+        if self._stop.cancelled:
+            return
+        if result is not None and not getattr(result, "success", False):
+            if getattr(result, "cancelled", False):
+                return
+            self._transition(
+                AssistantState.ERROR,
+                "Speech output failed",
+                error=getattr(result, "error", None),
+            )
+            self._emit("speech_error", "Speech output failed")
+            return
+        self._transition(return_state, "Ready")
+        self._emit("speech_finished", "Speech finished")
+
+    def _tts_is_speaking(self) -> bool:
+        try:
+            return bool(getattr(self.tts, "is_speaking", False))
+        except Exception:
+            return False
+
+    def _transition(self, state: AssistantState, message: str, **details: Any) -> None:
+        self.states.transition(state, message, **details)
 
     def _emit(self, kind: str, message: str, transcript: TranscriptResult | None = None, *, reply: CompanionReply | None = None, confidence: float | None = None) -> None:
         self.on_event(VoiceRuntimeEvent(kind, message, transcript, reply, confidence))

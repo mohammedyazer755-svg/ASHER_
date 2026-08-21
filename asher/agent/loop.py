@@ -72,7 +72,7 @@ class AgentLoop:
             self.emergency_stop.register(token)
             self._active = ActiveExecution(plan=plan, session=session, token=token, dry_run=dry_run)
         self.audit.append("plan_started", actor_id=session.actor.user_id, session_id=session.session_id, details={"plan_id": plan.plan_id, "steps": len(plan.steps)})
-        self.states.transition(AssistantState.ACTING, "Executing the approved plan", plan_id=plan.plan_id)
+        self.states.transition(AssistantState.EXECUTING, "Executing the approved plan", plan_id=plan.plan_id)
         return self._run_until_pause()
 
     def _run_until_pause(self) -> list[ExecutionUpdate]:
@@ -114,6 +114,13 @@ class AgentLoop:
                 metadata={"plan_id": active.plan.plan_id, "step_index": index},
             )
             try:
+                self.states.transition(
+                    AssistantState.EXECUTING,
+                    step.description or f"Executing {step.call.tool_name}",
+                    plan_id=active.plan.plan_id,
+                    step_id=step.step_id,
+                    step_index=index,
+                )
                 result = self.registry.execute(step.call, context)
             except CancelledError as error:
                 updates.append(self._finish_cancelled(active, str(error)))
@@ -122,6 +129,15 @@ class AgentLoop:
                 updates.append(self._finish_cancelled(active, active.token.reason or "Emergency stop activated"))
                 return updates
             active.results.append(result)
+            self.states.transition(
+                AssistantState.OBSERVING,
+                "Checking the tool result",
+                plan_id=active.plan.plan_id,
+                step_id=step.step_id,
+                step_index=index,
+                success=result.success,
+                evidence_count=len(result.evidence),
+            )
             updates.append(ExecutionUpdate("step", result.message, active.plan.plan_id, index + 1, len(active.plan.steps), result))
 
             if result.status in {"awaiting_confirmation", "awaiting_strong_auth"}:
@@ -134,6 +150,13 @@ class AgentLoop:
             if not result.success:
                 if result.retryable and attempt < self.max_retries:
                     updates.append(ExecutionUpdate("retrying", "The step failed transiently; retrying safely.", active.plan.plan_id, index + 1, len(active.plan.steps), result))
+                    self.states.transition(
+                        AssistantState.EXECUTING,
+                        "Retrying the failed step safely",
+                        plan_id=active.plan.plan_id,
+                        step_id=step.step_id,
+                        step_index=index,
+                    )
                     continue
                 updates.append(self._finish_failure(active, result.message))
                 return updates
@@ -191,6 +214,11 @@ class AgentLoop:
             plan_id=active.plan.plan_id,
             created_at=active.plan.created_at,
         )
+        self.states.transition(
+            AssistantState.EXECUTING,
+            "Confirmation approved; resuming the plan",
+            plan_id=active.plan.plan_id,
+        )
         return self._run_until_pause()
 
     def reject(self, confirmation_id: str, session: SessionContext) -> list[ExecutionUpdate]:
@@ -237,7 +265,7 @@ class AgentLoop:
 
     def _finish_success(self, active: ActiveExecution) -> ExecutionUpdate:
         self._clear_active(active)
-        self.states.transition(AssistantState.COMPLETE, "Plan completed with verification", plan_id=active.plan.plan_id)
+        self.states.transition(AssistantState.SUCCESS, "Plan completed with verification", plan_id=active.plan.plan_id)
         self.audit.append("plan_completed", actor_id=active.session.actor.user_id, session_id=active.session.session_id, details={"plan_id": active.plan.plan_id})
         return ExecutionUpdate("complete", "Plan completed with verified results.", active.plan.plan_id, len(active.plan.steps), len(active.plan.steps))
 

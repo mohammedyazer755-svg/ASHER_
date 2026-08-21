@@ -1,5 +1,50 @@
 # ASHER Project Progress
 
+## Continuation update — Cinematic UI Phase UI-1: truthful state/event bridge (2026-08-21)
+
+### Owner baseline before this change
+
+- Local Git baseline commit: `28d581d` — `Baseline before cinematic UI - 82 tests passing`.
+- Development branch: `feature/cinematic-ui`.
+- Owner Windows verification before this phase: 82/82 unit tests passed and the legacy offline voice-accuracy smoke passed 16/16.
+
+### Implemented in UI-1
+
+- Expanded the canonical assistant state vocabulary for the cinematic companion flow:
+  `STANDBY`, `WAKE_DETECTED`, `AUTHENTICATING`, `AUTHENTICATED`, `LISTENING`,
+  `TRANSCRIBING`, `THINKING`, `AWAITING_CONFIRMATION`, `EXECUTING`, `OBSERVING`,
+  `SPEAKING`, `SUCCESS`, `ERROR`, `OFFLINE`, `STOPPED`, and `LOCKED`.
+- Preserved the old `UNDERSTANDING`, `ACTING`, and `COMPLETE` values for legacy/fallback integrations.
+- `StateEvent` now records both previous and new state, giving the future orb an observable transition stream instead of relying on timed/fake animation.
+- The real `CompanionController` now publishes `THINKING`, `LOCKED`, and conversational `SUCCESS` states around planning/session decisions.
+- The real agent loop now distinguishes `EXECUTING` from `OBSERVING`, resumes `EXECUTING` after confirmation/retry, and publishes verified `SUCCESS` only after the tool loop completes.
+- The real voice runtime now publishes standby/listen/transcribe/wake/auth/locked/speaking transitions through the same canonical state store used by the agent.
+- Desktop microphone activity is now a separate `DesktopStatus.microphone_active` signal. Keeping the microphone runtime alive no longer masks deeper states such as thinking, executing, observing, confirmation, or speaking.
+- The desktop adapter exposes the existing canonical state stream through `subscribe_state()` for the upcoming PySide6 orb bridge.
+- Text-fallback TTS now publishes a truthful `SPEAKING` state and returns to `SUCCESS` or `AWAITING_CONFIRMATION` after speech completes.
+- The existing dashboard listen button now follows microphone activity rather than assuming that semantic state `LISTENING` means the microphone worker is running.
+
+### Tests added/updated
+
+- Added `tests/test_cinematic_state_bridge.py` covering:
+  - previous/new state publication;
+  - availability of the complete cinematic state vocabulary;
+  - real controller ordering through think -> execute -> observe -> success.
+- Updated the UI adapter background-voice-runtime regression test to prove that microphone activity does not hide `THINKING`.
+
+### Verification while preparing this phase
+
+- `python -m compileall -q .`: PASS.
+- Focused state/UI/agent/voice suite: 29 tests run, 28 passed, 1 optional PySide6 smoke skipped in the sandbox.
+- `python -B test_voice_accuracy.py`: 16/16 PASS.
+- Full sandbox discovery finds 85 tests. One pre-existing VoiceGuard import-laziness assertion cannot be evaluated in this ChatGPT execution host because the host preloads NumPy before Python user code starts. This phase does not modify VoiceGuard. The owner's pre-change Windows baseline passed that test, so the authoritative post-change result must come from `D:\VOICE AI` using `.\run_tests.ps1` after applying UI-1.
+
+### Exact next action
+
+Apply the UI-1 patch on `feature/cinematic-ui`, run `.\run_tests.ps1` on the owner's Windows machine, and do not continue to orb rendering until the complete suite is green. If green, commit UI-1 before starting the procedural orb widget.
+
+---
+
 Last updated: 2026-08-20 (Asia/Calcutta)
 
 ## Continuation update — live voice and communication fail-closed pass (2026-08-20)

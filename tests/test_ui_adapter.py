@@ -9,6 +9,7 @@ from pathlib import Path
 from asher.agent.controller import CompanionController
 from asher.brain.deterministic import ContactResolver
 from asher.config import AsherConfig
+from asher.core.state import AssistantState
 from asher.security.strong_auth import StrongAuthResult
 from asher.types import AuthMethod, RiskLevel
 from asher.ui.companion_adapter import CompanionDesktopController
@@ -123,13 +124,25 @@ class UIAdapterTests(unittest.TestCase):
                 voice_runtime_factory=factory,
             )
             self.assertFalse(adapter.status().emergency_stopped)
-            self.assertEqual(adapter.toggle_listening().state.value, "listening")
+            started_status = adapter.toggle_listening()
+            self.assertEqual(started_status.state.value, "standby")
+            self.assertTrue(started_status.microphone_active)
+            # The microphone runtime being active must not mask a deeper
+            # assistant state such as thinking/executing/speaking.
+            controller.loop.states.transition(
+                AssistantState.THINKING,
+                "Thinking test",
+            )
+            self.assertEqual(adapter.status().state.value, "thinking")
+            self.assertTrue(adapter.status().microphone_active)
             deadline = time.monotonic() + 1.0
             while not holder and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(holder and holder[0].started.wait(1.0))
-            adapter.toggle_listening()
+            stopped_status = adapter.toggle_listening()
             self.assertTrue(holder[0].stopped.is_set())
+            self.assertFalse(stopped_status.microphone_active)
+            self.assertEqual(stopped_status.state.value, "standby")
             self.assertFalse(adapter.status().emergency_stopped)
 
 

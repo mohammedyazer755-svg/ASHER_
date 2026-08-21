@@ -52,6 +52,7 @@ class DesktopStatus:
     offline: bool
     api_configured: bool
     emergency_stopped: bool
+    microphone_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +273,7 @@ class DesktopController:
                 self._settings.offline_only,
                 bool(os.getenv("OPENAI_API_KEY", "").strip() and importlib.util.find_spec("openai")),
                 self._emergency.latched,
+                self._state == AssistantState.LISTENING,
             )
 
     def toggle_listening(self) -> DesktopStatus:

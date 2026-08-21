@@ -219,7 +219,7 @@ else:
         def refresh_status(self, status: Any) -> None:
             self.state.setText(status.state.value.upper().replace("_", " "))
             self.status.setText(status.message)
-            self.listen_button.setText("Stop listening" if status.state == AssistantState.LISTENING else "Start listening")
+            self.listen_button.setText("Stop listening" if status.microphone_active else "Start listening")
             self.offline.setText("Offline mode: ON" if status.offline else "Offline mode: available fallback")
             self.api.setText("API: configured" if status.api_configured else "API: not configured")
 

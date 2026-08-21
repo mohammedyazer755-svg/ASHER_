@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from asher.agent.controller import CompanionController
 from asher.core.redaction import redact_text
-from asher.core.state import AssistantState
+from asher.core.state import AssistantState, StateEvent
 from asher.memory.store import MemoryRecord as StoreMemoryRecord, MemoryStore
 from asher.security.strong_auth import DenyStrongAuthenticator, StrongAuthenticator
 from asher.types import AuthMethod, RiskLevel, Role, utc_now
@@ -92,13 +92,26 @@ class CompanionDesktopController:
             api_enabled=companion.config.openai_enabled,
             microphone_index=None,
         )
+        self._unsubscribe_state = companion.loop.states.subscribe(self._on_state_event)
 
     # ------------------------------------------------------------------ state
+    def _on_state_event(self, event: StateEvent) -> None:
+        """Mirror the canonical core-state reason into the desktop status text."""
+
+        message = redact_text(event.message).strip()
+        if not message:
+            return
+        with self._lock:
+            self._message = message
+
+    def subscribe_state(self, callback: Callable[[StateEvent], None]) -> Callable[[], None]:
+        """Expose the existing canonical state stream for the future orb bridge."""
+
+        return self.companion.loop.states.subscribe(callback)
+
     def _state(self) -> AssistantState:
         if self.companion.emergency_stopped:
             return AssistantState.STOPPED
-        if self._listening:
-            return AssistantState.LISTENING
         active = self.companion.loop.active
         if active is not None and active.waiting_confirmation_id:
             return AssistantState.AWAITING_CONFIRMATION
@@ -114,6 +127,7 @@ class CompanionDesktopController:
                 api_configured=self.companion.config.openai_enabled
                 and importlib.util.find_spec("openai") is not None,
                 emergency_stopped=self.companion.emergency_stopped,
+                microphone_active=self._listening,
             )
 
     def toggle_listening(self) -> DesktopStatus:
@@ -135,6 +149,11 @@ class CompanionDesktopController:
                 self._voice_thread = thread
                 self._listening = True
                 self._message = "Listening for Hey Asher"
+                self.companion.loop.states.transition(
+                    AssistantState.STANDBY,
+                    "Listening for Hey Asher",
+                    microphone_active=True,
+                )
             else:
                 runtime_to_stop = self._voice_runtime
                 thread_to_join = self._voice_thread
@@ -142,6 +161,11 @@ class CompanionDesktopController:
                 self._voice_runtime = None
                 self._voice_thread = None
                 self._message = "Listening paused"
+                self.companion.loop.states.transition(
+                    AssistantState.STANDBY,
+                    "Listening paused",
+                    microphone_active=False,
+                )
             self.companion.audit.append(
                 "ui_listening",
                 actor_id=self._owner_session.actor.user_id,
@@ -188,6 +212,11 @@ class CompanionDesktopController:
                 self._message = f"Voice input unavailable: {type(error).__name__}"
                 self._voice_runtime = None
                 self._voice_thread = None
+                self.companion.loop.states.transition(
+                    AssistantState.ERROR,
+                    self._message,
+                    error=type(error).__name__,
+                )
             self.companion.audit.append(
                 "ui_voice_error",
                 actor_id=self._owner_session.actor.user_id,
@@ -257,17 +286,71 @@ class CompanionDesktopController:
                 status = "awaiting_confirmation" if reply.confirmation_id else "complete"
                 self._replace_step(step_id, status, detail)
                 self._message = reply.text
-            try:
-                self._tts.speak_async(reply.text, interrupt=True)
-            except Exception:
-                # Text mode remains usable when no local speech provider exists.
-                pass
+            self._speak_reply(
+                reply.text,
+                return_state=(
+                    AssistantState.AWAITING_CONFIRMATION
+                    if reply.confirmation_id
+                    else AssistantState.SUCCESS
+                ),
+            )
             return response
         except Exception as error:
             with self._lock:
                 self._replace_step(step_id, "error", f"{type(error).__name__}")
                 self._message = "Request failed safely"
             raise
+
+    def _speak_reply(self, text: str, *, return_state: AssistantState) -> None:
+        clean = str(text).strip()
+        if not clean:
+            return
+        try:
+            self.companion.loop.states.transition(
+                AssistantState.SPEAKING,
+                "Speaking",
+                voice_profile=self._tts.selected_profile_name,
+            )
+            handle = self._tts.speak_async(clean, interrupt=True)
+        except Exception:
+            # Text mode remains usable when no local speech provider exists.
+            self.companion.loop.states.transition(
+                return_state,
+                "Ready",
+            )
+            return
+        wait = getattr(handle, "wait", None)
+        if not callable(wait):
+            self.companion.loop.states.transition(return_state, "Ready")
+            return
+
+        def finish_state() -> None:
+            try:
+                result = handle.wait()
+            except Exception as error:
+                self.companion.loop.states.transition(
+                    AssistantState.ERROR,
+                    "Speech output failed",
+                    error=type(error).__name__,
+                )
+                return
+            if result is not None and not getattr(result, "success", False):
+                if getattr(result, "cancelled", False):
+                    return
+                self.companion.loop.states.transition(
+                    AssistantState.ERROR,
+                    "Speech output failed",
+                    error=getattr(result, "error", None),
+                )
+                return
+            if not self.companion.emergency_stopped:
+                self.companion.loop.states.transition(return_state, "Ready")
+
+        threading.Thread(
+            target=finish_state,
+            name="asher-ui-tts-state",
+            daemon=True,
+        ).start()
 
     def _replace_step(self, step_id: str, status: str, detail: str = "") -> None:
         self._steps = [
