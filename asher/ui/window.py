@@ -134,13 +134,14 @@ else:
     QLabel#orbState { color: #f4f7fb; font-size: 17pt; font-weight: 700; }
     QLabel#orbMessage { color: #aebdd1; font-size: 11pt; }
     QFrame#orbStage { background: #05070b; border: 1px solid #182233; border-radius: 22px; }
-    QWidget#companionMode { background: #020408; }
-    QFrame#companionHud { background: rgba(5, 10, 18, 210); border: 1px solid #15334a; border-radius: 14px; }
-    QLabel#companionBrand { color: #9eeaff; font-size: 16pt; font-weight: 700; letter-spacing: 2px; }
-    QLabel#companionState { color: #f4f7fb; font-size: 18pt; font-weight: 700; }
-    QLabel#companionMessage { color: #a7bfd0; font-size: 11pt; }
-    QLabel#companionTelemetry { color: #7fb9d0; font-size: 9pt; }
-    QFrame#companionConfirm { background: rgba(18, 21, 18, 225); border: 1px solid #9d742e; border-radius: 12px; }
+    QWidget#companionMode { background: #02060b; border: 0; }
+    QLabel#companionBrand { color: #dff8ff; font-size: 10pt; font-weight: 650; letter-spacing: 4px; }
+    QLabel#companionState { color: #f4f7fb; font-size: 16pt; font-weight: 650; }
+    QLabel#companionMessage { color: #9cb0c1; font-size: 10pt; }
+    QLabel#companionTelemetry { color: #71889a; font-size: 8pt; letter-spacing: 1px; padding-right: 8px; }
+    QPushButton#companionStop { background: rgba(66, 18, 28, 150); color: #ffcbd3; border: 1px solid rgba(199, 70, 90, 135); border-radius: 9px; padding: 6px 13px; font-weight: 700; }
+    QPushButton#companionStop:hover { background: rgba(111, 27, 42, 190); }
+    QFrame#companionConfirm { background: rgba(5, 9, 14, 232); border: 1px solid rgba(255, 180, 74, 120); border-radius: 10px; }
     QLabel#statusChip { background: #1b3150; color: #bcd7f7; border-radius: 10px; padding: 5px 10px; }
     QLabel#warning { background: #4b3416; color: #ffd994; border: 1px solid #916721; border-radius: 8px; padding: 8px; }
     QLabel#danger { color: #ffb4b4; }
@@ -298,45 +299,59 @@ else:
 
 
     class CompanionModePage(QWidget):
-        """Immersive voice-only scene shown during active conversation."""
+        """Minimal immersive scene shown only during an active voice interaction.
+
+        Workspace owns history, diagnostics and detailed runtime data. Companion
+        mode intentionally keeps only the living ASHER visual, truthful state
+        text, a tiny provider indicator and the always-available local Stop path.
+        """
 
         def __init__(self, window: "AsherMainWindow") -> None:
             super().__init__()
             self.window = window
             self.setObjectName("companionMode")
             root = QVBoxLayout(self)
-            root.setContentsMargins(24, 18, 24, 22)
-            root.setSpacing(10)
+            root.setContentsMargins(24, 16, 24, 18)
+            root.setSpacing(0)
 
             top = QHBoxLayout()
-            top.addWidget(_label("ASHER", "companionBrand"))
+            top.setContentsMargins(0, 0, 0, 0)
+            self.brand = _label("ASHER", "companionBrand")
+            top.addWidget(self.brand)
             top.addStretch()
-            self.telemetry = _label("LOCAL · VOICE · GUARDED", "companionTelemetry")
-            top.addWidget(self.telemetry)
+            self.presence = _label("LOCAL", "companionTelemetry")
+            top.addWidget(self.presence)
             stop = QPushButton("STOP")
-            stop.setObjectName("dangerButton")
-            stop.setMinimumWidth(92)
+            stop.setObjectName("companionStop")
+            stop.setToolTip("Emergency stop — cancel the active ASHER plan and voice output")
+            stop.setMinimumWidth(74)
             stop.clicked.connect(window.emergency_stop)
             top.addWidget(stop)
             root.addLayout(top)
 
             root.addStretch(1)
             self.orb = AsherOrbWidget(self)
-            self.orb.set_interactive_resize(True, initial_size=560)
-            root.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter)
+            self.orb.set_cinematic_mode(True)
+            self.orb.set_interactive_resize(True, initial_size=760)
+            self.orb.set_overlay_text("LISTENING", "")
+            root.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+            root.addStretch(1)
 
+            # Hidden compatibility labels keep real state/message text available
+            # to accessibility/smoke tests without cluttering the immersive view.
             self.state = _label("STANDBY", "companionState")
-            self.state.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            root.addWidget(self.state)
             self.message = _label("Say “Hey Asher”", "companionMessage")
-            self.message.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            self.state.setVisible(False)
+            self.message.setVisible(False)
+            root.addWidget(self.state)
             root.addWidget(self.message)
-            root.addSpacing(4)
 
             self.confirm = QFrame()
             self.confirm.setObjectName("companionConfirm")
+            self.confirm.setMaximumWidth(760)
             confirm_layout = QVBoxLayout(self.confirm)
-            confirm_layout.setContentsMargins(14, 10, 14, 10)
+            confirm_layout.setContentsMargins(18, 12, 18, 12)
+            confirm_layout.setSpacing(8)
             self.confirm_summary = _label("", "companionMessage")
             self.confirm_summary.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             confirm_layout.addWidget(self.confirm_summary)
@@ -352,12 +367,7 @@ else:
             actions.addStretch()
             confirm_layout.addLayout(actions)
             self.confirm.setVisible(False)
-            root.addWidget(self.confirm)
-            root.addStretch(1)
-
-            hint = _label("Scroll over the sphere to resize · gesture control plugs into the same scale hook later", "companionTelemetry")
-            hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            root.addWidget(hint)
+            root.addWidget(self.confirm, 0, Qt.AlignmentFlag.AlignHCenter)
 
         def set_state_event(self, event: Any) -> None:
             state = getattr(event, "state", None)
@@ -367,18 +377,22 @@ else:
             message = str(getattr(event, "message", "") or "").strip()
             if message:
                 self.message.setText(message)
+            self.orb.set_overlay_text(self.state.text(), self.message.text())
 
         def refresh_status(self, status: Any) -> None:
             self.orb.set_state(status.state)
-            self.state.setText(status.state.value.upper().replace("_", " "))
-            self.message.setText(status.message or visual_for_state(status.state).label)
-            provider = "OFFLINE" if status.offline else ("HYBRID" if status.api_configured else "LOCAL")
-            mic = "MIC ACTIVE" if status.microphone_active else "MIC STANDBY"
-            self.telemetry.setText(f"{provider} · {mic}")
+            state_text = status.state.value.upper().replace("_", " ")
+            message = status.message or visual_for_state(status.state).label
+            self.state.setText(state_text)
+            self.message.setText(message)
+            self.orb.set_overlay_text(state_text, message)
+            self.presence.setText("OFFLINE" if status.offline else "LOCAL")
+            if status.emergency_stopped:
+                self.presence.setText("STOPPED")
 
         def refresh_settings(self, settings: DesktopSettings) -> None:
-            profile = str(settings.voice_profile or "default").replace("_", " ").upper()
-            self.telemetry.setToolTip(f"Voice profile: {profile}")
+            profile = str(settings.voice_profile or "default").replace("_", " ")
+            self.presence.setToolTip(f"Voice: {profile}")
 
         def refresh_pending(self, pending: PendingAction | None) -> None:
             self.confirm.setVisible(pending is not None)
@@ -731,6 +745,8 @@ else:
             self._state_unsubscribe: Callable[[], None] | None = None
             self._state_bridge = _StateSignalBridge(self)
             self._state_bridge.state_event.connect(self._on_state_event)
+            self._companion_fullscreen_active = False
+            self._restore_maximized_after_companion = False
             self.setWindowTitle("Asher — authenticated personal companion")
             self.setMinimumSize(1120, 720)
             self.resize(1320, 820)
@@ -841,7 +857,22 @@ else:
             target = self.companion_mode if enabled else self.workspace
             if self.mode_stack.currentWidget() is target:
                 return
+
+            if enabled:
+                self._restore_maximized_after_companion = self.isMaximized()
+                self.mode_stack.setCurrentWidget(target)
+                if self.isVisible() and not self.isFullScreen():
+                    self.showFullScreen()
+                    self._companion_fullscreen_active = True
+                return
+
             self.mode_stack.setCurrentWidget(target)
+            if self._companion_fullscreen_active and self.isFullScreen():
+                if self._restore_maximized_after_companion:
+                    self.showMaximized()
+                else:
+                    self.showNormal()
+            self._companion_fullscreen_active = False
 
         def _sync_mode_for_status(self, status: Any) -> None:
             self._set_companion_mode(

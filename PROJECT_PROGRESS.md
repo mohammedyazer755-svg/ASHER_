@@ -1,3 +1,52 @@
+## Continuation update — Cinematic UI final freeze: minimal companion scene (2026-08-21)
+
+### Final visual decision
+- Workspace mode remains the normal ASHER management surface for conversation history, memory, confirmations, VoiceGuard/users, permissions, activity, settings and diagnostics.
+- Active voice interaction switches to a deliberately minimal full-screen Companion scene. The previous sci-fi HUD cards and decorative telemetry were removed because they made the interface look synthetic and duplicated information already available in Workspace.
+- Companion mode now keeps only: the ASHER identity, a truthful local/offline presence indicator, the persistent emergency Stop control, the state-driven energy sphere, real state/transcript text and the exact confirmation strip when a consequential action requires approval.
+- The cinematic sphere remains original procedural PySide6 rendering connected to canonical ASHER state. It does not advance state, fabricate success or display invented metrics.
+- Sphere scaling remains bounded and testable by desktop wheel input. Webcam hand tracking is intentionally **not** claimed as part of the visual UI; it remains a later interaction capability.
+
+### Scope frozen
+- Do not spend further implementation cycles on cosmetic orb/HUD tuning before the core ASHER roadmap is completed. Visual polish may be revisited only during final acceptance.
+- Detailed provider, planner, executor, VoiceGuard and diagnostic data stay in Workspace instead of being copied into Companion mode.
+
+### Verification in handoff environment
+- `python -m compileall -q asher tests`: PASS.
+- 95 tests are discovered after the final minimal-UI contract test. Qt tests require PySide6 and are skipped in this handoff environment.
+- The environment still shows the already-known VoiceGuard import-safety false failure because optional numerical modules are preloaded here; the owner's Windows `run_tests.ps1` result is authoritative.
+
+### Exact next action after Windows verification
+Run the full Windows test suite and one live Companion smoke test. If green, commit the complete UI work as a single checkpoint and move immediately to **VoiceGuard real-data Phase VG-1: owner recording sessions, dataset manifest, session-separated train/validation/test split and first measured baseline**.
+
+---
+
+## Continuation update — Cinematic UI Phase UI-3B: immersive plasma HUD renderer (2026-08-21)
+
+### Visual target clarified by owner
+- The compact dashboard orb is **not** the target for active conversation.
+- Workspace/dashboard mode remains for history, memory, confirmations, VoiceGuard, settings and diagnostics.
+- Active voice conversation uses a separate immersive, near-black HUD scene inspired by the supplied reference video, implemented with original procedural rendering rather than copied assets.
+
+### Implemented in UI-3B
+- Added a dedicated cinematic renderer mode to `AsherOrbWidget` while preserving the compact workspace renderer.
+- Cinematic sphere now uses a bright plasma shell, animated internal energy filaments, crossing energy orbits, star/particle field, central scan line, bloom and state-driven colours.
+- State and message are painted inside the sphere instead of below it in Companion mode.
+- Added truthful side HUD panels for microphone/session/state, safety boundary, provider/voice/privacy and live transcript/planner/executor activity. No fabricated CPU/network/accuracy numbers are shown.
+- Companion mode enters full-screen only during the active voice scene and returns to the previous workspace window mode afterwards.
+- Existing emergency stop and confirmation controls remain available in the immersive scene.
+- Existing bounded mouse-wheel sphere scaling remains. Actual webcam/hand tracking is still **not implemented** and remains the next interaction milestone.
+
+### Verification
+- `python -m compileall -q asher tests`: PASS in the handoff environment.
+- 94 tests are discovered after UI-3B additions. New Qt visual/fullscreen tests require PySide6 on the Windows project environment.
+- The handoff environment still exhibits its known VoiceGuard import-safety false failure because optional numerical modules are preloaded by that environment; the owner Windows baseline is authoritative for this test.
+
+### Exact next action
+Apply UI-3B on the Windows `feature/cinematic-ui` branch, run `run_tests.ps1`, then launch `run_asher.ps1 -Mode ui -Live` and visually compare the active Companion scene with the supplied reference. Tune plasma/HUD geometry only after the functional/fullscreen tests are green.
+
+---
+
 # ASHER Project Progress
 
 
@@ -437,3 +486,11 @@ Create the Phase 1 package skeleton and tests: runtime config/path isolation, ty
 - [ ] Clean documented test command passes all environment-independent tests.
 - [ ] `RUN_ASHER.md`, scripts, and faculty demonstration procedure are complete.
 - [ ] Physical-only and credential-only verification gaps are stated precisely.
+
+## UI-3B.1 — reference-fidelity plasma pass
+- Refined the immersive sphere after visual comparison with the supplied reel frames.
+- Removed visible concentric glow disks and the opaque cyan-ball look.
+- Added a mostly-transparent interior, hotter irregular electrical shell, outward sparks, and brighter crossing energy bands.
+- Matched the companion-page background to the orb canvas so the renderer no longer appears as a black square inside the scene.
+- Reduced HUD footprint and removed development-style placeholder copy while preserving truthful status and emergency stop.
+- No assistant state, safety, tool, memory, voice, or provider behavior was changed.

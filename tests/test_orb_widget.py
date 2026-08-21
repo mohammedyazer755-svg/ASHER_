@@ -56,3 +56,39 @@ class OrbQtSmokeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(is_available(), "PySide6 is optional; install it for orb smoke tests")
+class CinematicOrbContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(["asher-cinematic-orb-test"])
+
+    def test_cinematic_renderer_does_not_change_assistant_state(self) -> None:
+        from asher.ui.orb_widget import AsherOrbWidget
+
+        orb = AsherOrbWidget()
+        orb.set_state(AssistantState.THINKING)
+        before = orb.state
+        orb.set_cinematic_mode(True)
+        orb.set_overlay_text("THINKING", "Planning a safe action")
+        orb.resize(690, 690)
+        orb.show()
+        self.app.processEvents()
+        self.assertIs(orb.state, before)
+        self.assertTrue(orb._cinematic_mode)
+        orb.close()
+
+    def test_cinematic_renderer_uses_large_bounded_display(self) -> None:
+        from asher.ui.orb_widget import AsherOrbWidget
+
+        orb = AsherOrbWidget()
+        orb.set_cinematic_mode(True)
+        orb.set_interactive_resize(True, initial_size=760)
+        self.assertEqual(orb.width(), 760)
+        self.assertEqual(orb.set_display_size(1200), 900)
+        self.assertEqual(orb.set_display_size(100), 340)
+        orb.close()

@@ -63,7 +63,7 @@ def visual_for_state(state: AssistantState) -> OrbVisual:
 
 try:
     from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
-    from PySide6.QtGui import QColor, QBrush, QPainter, QPen, QRadialGradient
+    from PySide6.QtGui import QColor, QBrush, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QRadialGradient
     from PySide6.QtWidgets import QWidget
 
     QT_AVAILABLE = True
@@ -103,6 +103,9 @@ else:
             self._animation_intensity = 1.0
             self._interactive_resize = False
             self._display_size = 560
+            self._cinematic_mode = False
+            self._overlay_title = ""
+            self._overlay_message = ""
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._advance)
             self._sync_timer()
@@ -121,6 +124,21 @@ else:
             self._audio_level = 0.0 if state != AssistantState.SPEAKING else self._audio_level
             self._sync_timer()
             self.update()
+
+
+        def set_cinematic_mode(self, enabled: bool) -> None:
+            """Switch between compact workspace rendering and immersive HUD rendering."""
+
+            self._cinematic_mode = bool(enabled)
+            self.update()
+
+        def set_overlay_text(self, title: str, message: str = "") -> None:
+            """Set truthful state/message text painted inside the cinematic sphere."""
+
+            self._overlay_title = str(title or "").strip()
+            self._overlay_message = str(message or "").strip()
+            if self.isVisible():
+                self.update()
 
         def set_audio_level(self, level: float) -> None:
             """Accept a short-lived normalized level without retaining audio."""
@@ -222,16 +240,268 @@ else:
             height = float(self.height())
             center = QPointF(width / 2.0, height / 2.0)
             extent = min(width, height)
-            base_radius = extent * 0.205
             activity = self._audio_level if self._state in {AssistantState.LISTENING, AssistantState.SPEAKING} else 0.0
             pulse = math.sin(self._phase * 2.1) * self._visual.pulse * self._animation_intensity
-            radius = base_radius * (1.0 + pulse + activity * 0.10)
 
+            if self._cinematic_mode:
+                base_radius = extent * 0.345
+                radius = base_radius * (1.0 + pulse * 0.42 + activity * 0.075)
+                self._paint_cinematic(painter, center, radius, width, height)
+                return
+
+            base_radius = extent * 0.205
+            radius = base_radius * (1.0 + pulse + activity * 0.10)
             painter.fillRect(self.rect(), QColor("#05070B"))
             self._draw_ambient_glow(painter, center, radius)
             self._draw_particles(painter, center, radius)
             self._draw_orbits(painter, center, radius)
             self._draw_core(painter, center, radius)
+
+        def _paint_cinematic(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+            width: float,
+            height: float,
+        ) -> None:
+            """Render the minimal active-companion scene.
+
+            The visual is intentionally not a dashboard.  The sphere is the
+            interface; detailed runtime information stays in Workspace mode.
+            """
+
+            painter.fillRect(self.rect(), QColor("#02060B"))
+            self._draw_starfield(painter, width, height)
+            self._draw_cinematic_glow(painter, center, radius)
+            self._draw_cinematic_body(painter, center, radius)
+            self._draw_inner_filaments(painter, center, radius)
+            self._draw_energy_orbits(painter, center, radius)
+            self._draw_plasma_shell(painter, center, radius)
+            self._draw_cinematic_particles(painter, center, radius)
+            self._draw_scanline(painter, center, width, radius)
+            self._draw_cinematic_text(painter, center, radius)
+
+        def _draw_starfield(self, painter: QPainter, width: float, height: float) -> None:
+            primary = QColor(self._visual.primary)
+            for index in range(34):
+                x = ((index * 149 + 31) % 997) / 997.0 * width
+                y = ((index * 263 + 73) % 991) / 991.0 * height
+                drift = math.sin(self._phase * (0.11 + (index % 4) * 0.02) + index) * 3.0
+                color = QColor("#EAFBFF" if index % 9 == 0 else primary)
+                color.setAlpha(22 + (index % 5) * 16)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                size = 0.55 + (index % 3) * 0.55
+                painter.drawEllipse(QPointF(x + drift, y), size, size)
+
+        def _draw_scanline(self, painter: QPainter, center: QPointF, width: float, radius: float) -> None:
+            primary = QColor(self._visual.primary)
+            y = center.y() + math.sin(self._phase * 0.42) * radius * 0.025
+            fade = QLinearGradient(0.0, y, width, y)
+            edge = QColor(primary)
+            edge.setAlpha(0)
+            mid = QColor(primary)
+            mid.setAlpha(46)
+            fade.setColorAt(0.0, edge)
+            fade.setColorAt(0.28, edge)
+            fade.setColorAt(0.46, mid)
+            fade.setColorAt(0.54, mid)
+            fade.setColorAt(0.72, edge)
+            fade.setColorAt(1.0, edge)
+            painter.setPen(QPen(QBrush(fade), 8.0))
+            painter.drawLine(QPointF(0.0, y), QPointF(width, y))
+            core = QColor("#DDF9FF")
+            core.setAlpha(72)
+            painter.setPen(QPen(core, 0.8))
+            painter.drawLine(QPointF(center.x() - radius * 1.55, y), QPointF(center.x() + radius * 1.55, y))
+
+        def _draw_cinematic_glow(self, painter: QPainter, center: QPointF, radius: float) -> None:
+            primary = QColor(self._visual.primary)
+            glow_radius = radius * 1.58
+            gradient = QRadialGradient(center, glow_radius)
+            gradient.setColorAt(0.0, QColor(primary.red(), primary.green(), primary.blue(), 12))
+            gradient.setColorAt(0.52, QColor(primary.red(), primary.green(), primary.blue(), 8))
+            gradient.setColorAt(0.72, QColor(primary.red(), primary.green(), primary.blue(), 22))
+            gradient.setColorAt(0.86, QColor(primary.red(), primary.green(), primary.blue(), 9))
+            gradient.setColorAt(1.0, QColor(primary.red(), primary.green(), primary.blue(), 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(gradient))
+            painter.drawEllipse(center, glow_radius, glow_radius)
+
+        def _draw_cinematic_body(self, painter: QPainter, center: QPointF, radius: float) -> None:
+            """Keep the centre dark; only a faint atmosphere suggests volume."""
+
+            primary = QColor(self._visual.primary)
+            gradient = QRadialGradient(center, radius)
+            gradient.setColorAt(0.0, QColor(2, 7, 12, 5))
+            gradient.setColorAt(0.48, QColor(primary.red(), primary.green(), primary.blue(), 7))
+            gradient.setColorAt(0.78, QColor(primary.red(), primary.green(), primary.blue(), 16))
+            gradient.setColorAt(0.94, QColor(primary.red(), primary.green(), primary.blue(), 24))
+            gradient.setColorAt(1.0, QColor(primary.red(), primary.green(), primary.blue(), 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(gradient))
+            painter.drawEllipse(center, radius, radius)
+
+        def _draw_plasma_shell(self, painter: QPainter, center: QPointF, radius: float) -> None:
+            """Layer smooth turbulence into a bright, living electrical shell."""
+
+            primary = QColor(self._visual.primary)
+            secondary = QColor(self._visual.secondary)
+            layers = (
+                (0.998, 246, 1.15, 0.010, "#F7FEFF"),
+                (1.004, 210, 2.2, 0.016, self._visual.primary),
+                (1.010, 118, 4.8, 0.024, self._visual.primary),
+                (1.024, 58, 9.0, 0.032, self._visual.secondary),
+                (1.044, 26, 15.0, 0.040, self._visual.primary),
+            )
+            for layer, (scale, alpha, thickness, jitter, color_value) in enumerate(layers):
+                path = QPainterPath()
+                for step in range(241):
+                    angle = math.tau * step / 240.0
+                    wave = (
+                        0.58 * math.sin(angle * (7 + layer) + self._phase * (2.0 + layer * 0.07))
+                        + 0.28 * math.sin(angle * (17 + layer * 2) - self._phase * 1.35 + layer)
+                        + 0.14 * math.sin(angle * 31 + self._phase * 0.83)
+                    )
+                    r = radius * scale * (1.0 + jitter * wave)
+                    point = QPointF(center.x() + math.cos(angle) * r, center.y() + math.sin(angle) * r)
+                    if step == 0:
+                        path.moveTo(point)
+                    else:
+                        path.lineTo(point)
+                path.closeSubpath()
+                color = QColor(color_value)
+                color.setAlpha(alpha)
+                pen = QPen(color, thickness)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(path)
+
+            # A few short, intermittent edge discharges.  Sparse is more
+            # convincing than filling the sphere with decorative scribbles.
+            for index in range(17):
+                phase = self._phase * (1.7 + (index % 3) * 0.13) + index * 2.17
+                strength = max(0.0, math.sin(phase))
+                if strength < 0.58:
+                    continue
+                angle = (index / 17.0) * math.tau + self._phase * 0.08
+                start_r = radius * 1.005
+                length = radius * (0.018 + 0.065 * strength)
+                p1 = QPointF(center.x() + math.cos(angle) * start_r, center.y() + math.sin(angle) * start_r)
+                bend_angle = angle + math.sin(index * 1.7 + self._phase) * 0.12
+                p2 = QPointF(
+                    center.x() + math.cos(bend_angle) * (start_r + length),
+                    center.y() + math.sin(bend_angle) * (start_r + length),
+                )
+                glow = QColor(primary if index % 2 else secondary)
+                glow.setAlpha(40 + int(65 * strength))
+                painter.setPen(QPen(glow, 3.2))
+                painter.drawLine(p1, p2)
+                hot = QColor("#F7FEFF")
+                hot.setAlpha(120 + int(110 * strength))
+                painter.setPen(QPen(hot, 0.7))
+                painter.drawLine(p1, p2)
+
+        def _draw_inner_filaments(self, painter: QPainter, center: QPointF, radius: float) -> None:
+            clip = QPainterPath()
+            clip.addEllipse(center, radius * 0.91, radius * 0.91)
+            painter.save()
+            painter.setClipPath(clip)
+            for index in range(4):
+                painter.save()
+                painter.translate(center)
+                painter.rotate(index * 43.0 + math.degrees(self._phase) * (0.035 if index % 2 else -0.028))
+                painter.translate(-center)
+                path = QPainterPath()
+                points = 42
+                for step in range(points):
+                    t = -1.0 + 2.0 * step / (points - 1)
+                    x = center.x() + t * radius * 0.84
+                    envelope = math.sqrt(max(0.0, 1.0 - t * t))
+                    y = center.y() + (
+                        math.sin(t * math.pi * (1.65 + index * 0.18) + self._phase * (0.9 + index * 0.08) + index)
+                        * radius * (0.075 + index * 0.012) * envelope
+                    )
+                    y += math.sin(t * 11.0 + index * 1.8) * radius * 0.008 * envelope
+                    point = QPointF(x, y)
+                    if step == 0:
+                        path.moveTo(point)
+                    else:
+                        path.lineTo(point)
+                color = QColor("#E8FBFF" if index == 0 else self._visual.primary)
+                color.setAlpha(28 + index * 10)
+                painter.setPen(QPen(color, 0.75 + index * 0.12))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(path)
+                painter.restore()
+            painter.restore()
+
+        def _draw_energy_orbits(self, painter: QPainter, center: QPointF, radius: float) -> None:
+            """Quiet orbital geometry gives depth without becoming a HUD graphic."""
+
+            configs = ((39.0, 1.05, 0.39), (-48.0, 1.06, 0.39))
+            for index, (rotation, scale, flatten) in enumerate(configs):
+                painter.save()
+                painter.translate(center)
+                painter.rotate(rotation + math.degrees(self._phase) * 0.009 * (1 if index == 0 else -1))
+                painter.translate(-center)
+                r = radius * scale
+                rect = QRectF(center.x() - r, center.y() - r * flatten, r * 2, r * flatten * 2)
+                glow = QColor(self._visual.primary)
+                glow.setAlpha(28)
+                painter.setPen(QPen(glow, 4.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(rect)
+                core = QColor("#DDF8FF")
+                core.setAlpha(128 if index == 0 else 98)
+                painter.setPen(QPen(core, 0.75))
+                painter.drawEllipse(rect)
+                painter.restore()
+
+        def _draw_cinematic_particles(self, painter: QPainter, center: QPointF, radius: float) -> None:
+            count = max(10, int(self._visual.particles * 1.15 * self._animation_intensity))
+            primary = QColor(self._visual.primary)
+            for index in range(count):
+                angle = self._phase * (0.055 + (index % 4) * 0.012) + index * 2.399963
+                orbit = radius * (1.08 + 0.72 * (((index * 29) % 53) / 52.0))
+                x = center.x() + math.cos(angle) * orbit
+                y = center.y() + math.sin(angle) * orbit * 0.82
+                color = QColor("#FFFFFF" if index % 8 == 0 else primary)
+                color.setAlpha(38 + (index % 5) * 20)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                size = 0.65 + (index % 3) * 0.65
+                painter.drawEllipse(QPointF(x, y), size, size)
+
+        def _draw_cinematic_text(self, painter: QPainter, center: QPointF, radius: float) -> None:
+            title = self._overlay_title or self._state.value.upper().replace("_", " ")
+            message = self._overlay_message or self._visual.label
+            painter.setPen(QColor("#EDF9FC"))
+            font = QFont("Segoe UI")
+            font.setBold(True)
+            font.setPointSize(max(10, int(radius * 0.043)))
+            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.2)
+            painter.setFont(font)
+            title_rect = QRectF(center.x() - radius * 0.78, center.y() - 17.0, radius * 1.56, 34.0)
+            painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, title)
+
+            if message:
+                muted = QColor("#93AAB7")
+                muted.setAlpha(150)
+                painter.setPen(muted)
+                small = QFont("Segoe UI")
+                small.setPointSize(max(7, int(radius * 0.027)))
+                painter.setFont(small)
+                message_rect = QRectF(
+                    center.x() - radius * 0.72,
+                    center.y() + radius * 0.10,
+                    radius * 1.44,
+                    radius * 0.24,
+                )
+                painter.drawText(message_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, message[:96])
 
         def _draw_ambient_glow(self, painter: QPainter, center: QPointF, radius: float) -> None:
             primary = QColor(self._visual.primary)
