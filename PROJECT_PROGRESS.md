@@ -1,3 +1,49 @@
+## Continuation note — authoritative exact UI specification received (2026-08-22)
+
+- The owner supplied `ASHER_EXACT_UI_SPEC.md` as the authoritative visual and interaction reference for future UI work. Its contents are UI requirements and constraints, not authorization to rewrite ASHER's security, VoiceGuard, memory, planner, tools, providers, voice pipeline, or Android protocol.
+- The specification confirms the existing product split: Workspace remains the practical management surface; Companion is a continuous near-black active-conversation scene dominated by one large state-driven plasma sphere, minimal real state/transcript text, a small emergency stop, and no decorative HUD or fabricated telemetry.
+- Companion confirmations must remain minimal while displaying the exact consequential preview and preserving the real approval/strong-auth policy. The exact-preview regression is being closed as a functional safety defect, not a visual redesign.
+- Audio reactivity now uses a bounded scalar derived from real microphone PCM16 frames; raw PCM is not emitted or retained for presentation. TTS amplitude is not available from the current providers and is therefore not fabricated. Webcam gesture control must never be implied before a real local tracker exists.
+- Four owner-supplied orb screenshots (`230256`, `230310`, `230316`, and `230331`) are recorded as sphere-aesthetic references only: a layered luminous corona, compact hot core, a few braided arcs/wisps, sparse sparks, and blue/amber variants. Their captions, social chrome, monitor HUD, and gesture implications are explicitly excluded; canonical state colors, real RMS reactivity, and the minimal continuous scene remain authoritative.
+- After this owner-requested reference pass, UI scope remains frozen pending functional/spec acceptance. A live voice/visual pass on the owner's display is still required for the parts that automated offscreen tests cannot establish.
+
+---
+
+## Continuation update — VoiceGuard VG-1B and acceptance hardening (2026-08-22)
+
+### VoiceGuard software path completed
+
+- Training now loads only immutably sealed sessions registered to active enrollments; partial/failed collection manifests cannot enter training or be edited after finalization. Finalization rejects foreign-manager sessions, duplicate registration, and active identity role drift. Consented desktop partials are surfaced/resumed after restart only after fresh consent, and ambiguous partials fail closed without registration.
+- Added dependency-free, aggregate-only readiness reporting. It requires unique real source clips, at least three conservatively metadata-distinct sessions per class, a real non-replay unauthorized speaker identity, complete class coverage in train/validation/test, authorized and unauthorized calibration/test coverage, checksum integrity, and no identical audio crossing session boundaries. Same-environment sessions require a 30-minute timestamp interval; correlated extras are deterministically excluded from both readiness partitions and actual training, while environment/time metadata remains a quality guard rather than proof of physical independence.
+- Augmented clips require explicit same-session source linkage and matching classifier/authorization labels, and may enrich only the training partition. They cannot satisfy source-data readiness, enter calibration/test partitions, or create a fabricated noisy-condition metric. Real replay samples are always unauthorized, evaluation-only, and excluded from classifier fitting.
+- The student classifier resolves one global identity before authorizing that exact identity; it never authenticates by summing several users' probabilities. Held-out reports expose authorized-identity errors separately from binary FAR/FRR. Speaker and wake-word artifacts use separate registry keys, so experimental wake training cannot replace the active speaker model.
+- Model, validation report, and test report are content-versioned over every inference/security-relevant model field plus the stable independent-dataset provenance and written under ASHER's private runtime directory before registry activation. Existing versioned paths are never overwritten; partial persistence/activation failures remove the new bundle without changing prior files or activation.
+- `train_voiceguard.py --check` returns privacy-safe structural status without importing NumPy/scikit-learn. Normal training now reports measured held-out accuracy/F1/FAR/FRR and explicitly leaves absent noisy/replay metrics unavailable instead of raising a traceback or guessing.
+- Desktop VoiceGuard capture groups six clips into one real session and pauses immediate same-environment repeats. Partial sessions remain unregistered; shared thread/process locks and disk refresh prevent concurrent or stale adapters from losing clips, clearing revocation, or re-enrolling with stale consent. Every partial/finalized revocation routes through the lifecycle manager, which invalidates peer consent before manifest cleanup. Retraining snapshots under the lifecycle lock, fits outside it so revocation stays live, then compare-and-swaps the unchanged registry and full finalized-dataset fingerprint before artifact activation. Runtime verification validates the exact in-memory inference model and rechecks the bound on-disk model plus verified finalized-dataset fingerprint before and after inference.
+
+### Locally testable acceptance gaps closed
+
+- Companion-mode confirmations now display the complete exact preview as read-only plain text while preserving the minimal fullscreen scene, approval binding, strong authentication, and emergency stop.
+- The active desktop voice runtime honors `ASHER_MIC_INDEX` as either a non-negative index or exact device name; the setting remains lazy and opens no hardware during import/tests.
+- Both Workspace and Companion orbs receive the real microphone's normalized RMS scalar through the existing Qt-thread refresh path. The signal decays/resets safely, exposes no raw PCM, and does not pretend that synthetic TTS has an amplitude feed.
+- Workspace Memory now supports owner-only JSON export after fresh device authentication. Audit data records format/count only, never destination names or memory values.
+- Expired desktop owner sessions show **SESSION EXPIRED** and require an explicit Workspace-only device-auth reauthentication flow. Pending confirmations from the expired session are not rebound.
+
+### Verification and current real-data status
+
+- `./run_tests.ps1`: **180 tests passed, 0 failed**, including deterministic offscreen PySide6 orb rendering and all new readiness/security/UI/audio-signal/lifecycle regressions.
+- Legacy deterministic voice smoke: **16/16 passed**.
+- `verify_upgrade.py`: PASS. `pip check`: no broken requirements.
+- A metadata-only microphone query reports available Windows input devices. No new audio was recorded or retained during verification.
+- The private VoiceGuard inventory contains **1 finalized owner session / 6 clean clips / 1 class**. `train_voiceguard.py --check` exits `2` (not ready), correctly reporting no unauthorized class, fewer than three sessions for the owner class, and no possible session-separated split. No model or biometric accuracy claim exists yet.
+- The pre-existing uncommitted trailing-space/no-final-newline edit in `run_tests.ps1` was preserved as owner work; it is the only `git diff --check` finding and does not affect execution.
+
+### Exact next action
+
+Record at least **2 more owner sessions** and **3 consented `unknown_pool` sessions**, one invocation per genuinely separate time/environment, then run `train_voiceguard.py --check`. When it reports `READY`, run `train_voiceguard.py` to create the first honest held-out baseline. Separately, perform the live Companion visual/voice acceptance pass: automated tests verify the microphone-amplitude plumbing but cannot establish its response with the owner's physical microphone or visual fidelity on the owner's display, and the current TTS providers expose no real amplitude feed. Android build/device verification remains external because Java, Gradle wrapper/SDK, ADB, and a physical device are absent.
+
+---
+
 ## Continuation update — Cinematic UI final freeze: minimal companion scene (2026-08-21)
 
 ### Final visual decision

@@ -27,6 +27,7 @@ class EvaluationObservation:
     predicted_label: str
     expected_authorized: bool
     condition: str = SampleCondition.CLEAN.value
+    acceptance_eligible: bool = True
 
     def __post_init__(self) -> None:
         if not self.sample_id:
@@ -76,6 +77,9 @@ class EvaluationReport:
     accuracy: float | None
     false_accept_rate: float | None
     false_reject_rate: float | None
+    authorized_identity_sample_count: int
+    authorized_identity_error_count: int
+    authorized_identity_accuracy: float | None
     condition_metrics: Mapping[str, ConditionMetrics]
     unavailable_conditions: tuple[str, ...]
     threshold_curve: tuple[Mapping[str, float | None], ...]
@@ -104,6 +108,9 @@ class EvaluationReport:
             "accuracy": self.accuracy,
             "false_accept_rate": self.false_accept_rate,
             "false_reject_rate": self.false_reject_rate,
+            "authorized_identity_sample_count": self.authorized_identity_sample_count,
+            "authorized_identity_error_count": self.authorized_identity_error_count,
+            "authorized_identity_accuracy": self.authorized_identity_accuracy,
             "replay_acceptance_rate": self.replay_acceptance_rate,
             "condition_metrics": {
                 key: value.to_dict() for key, value in self.condition_metrics.items()
@@ -127,7 +134,7 @@ class EvaluationReport:
 def _binary_counts(observations: Sequence[EvaluationObservation], threshold: float) -> tuple[int, int, int, int]:
     true_positive = false_positive = true_negative = false_negative = 0
     for item in observations:
-        accepted = item.score >= threshold
+        accepted = item.acceptance_eligible and item.score >= threshold
         if item.expected_authorized and accepted:
             true_positive += 1
         elif item.expected_authorized and not accepted:
@@ -144,9 +151,15 @@ def _condition_metrics(
     threshold: float,
 ) -> ConditionMetrics:
     tn, fp, fn, tp = _binary_counts(observations, threshold)
-    correct = sum((item.score >= threshold) == item.expected_authorized for item in observations)
+    correct = sum(
+        (item.acceptance_eligible and item.score >= threshold) == item.expected_authorized
+        for item in observations
+    )
     replay_rate = (
-        _safe_ratio(sum(item.score >= threshold for item in observations), len(observations))
+        _safe_ratio(
+            sum(item.acceptance_eligible and item.score >= threshold for item in observations),
+            len(observations),
+        )
         if observations and observations[0].condition == SampleCondition.REPLAY.value
         else None
     )
@@ -204,6 +217,15 @@ def evaluate_predictions(
     recall = _safe_ratio(tp, tp + fn)
     f1 = None if precision is None or recall is None or precision + recall == 0 else 2 * precision * recall / (precision + recall)
     accuracy = _safe_ratio(tp + tn, len(items))
+    authorized_identity_items = tuple(item for item in items if item.expected_authorized)
+    authorized_identity_errors = sum(
+        item.predicted_label != item.true_label
+        for item in authorized_identity_items
+    )
+    authorized_identity_accuracy = _safe_ratio(
+        len(authorized_identity_items) - authorized_identity_errors,
+        len(authorized_identity_items),
+    )
 
     by_condition: dict[str, list[EvaluationObservation]] = {item.value: [] for item in SampleCondition}
     for item in items:
@@ -234,6 +256,9 @@ def evaluate_predictions(
         accuracy=accuracy,
         false_accept_rate=_safe_ratio(fp, fp + tn),
         false_reject_rate=_safe_ratio(fn, fn + tp),
+        authorized_identity_sample_count=len(authorized_identity_items),
+        authorized_identity_error_count=authorized_identity_errors,
+        authorized_identity_accuracy=authorized_identity_accuracy,
         condition_metrics=condition_results,
         unavailable_conditions=unavailable,
         threshold_curve=_threshold_curve(items),
@@ -250,15 +275,19 @@ def observations_from_scores(
     predicted_labels: Sequence[str],
     expected_authorized: Sequence[bool],
     conditions: Sequence[str] | None = None,
+    acceptance_eligible: Sequence[bool] | None = None,
 ) -> tuple[EvaluationObservation, ...]:
     """Convenience constructor that validates aligned evaluation arrays."""
 
     lengths = {len(sample_ids), len(true_labels), len(scores), len(predicted_labels), len(expected_authorized)}
     if conditions is not None:
         lengths.add(len(conditions))
+    if acceptance_eligible is not None:
+        lengths.add(len(acceptance_eligible))
     if len(lengths) != 1:
         raise ValueError("evaluation arrays must have equal lengths")
     selected_conditions = conditions or [SampleCondition.CLEAN.value] * len(sample_ids)
+    selected_eligibility = acceptance_eligible or [True] * len(sample_ids)
     return tuple(
         EvaluationObservation(
             sample_id=sample_ids[index],
@@ -267,6 +296,7 @@ def observations_from_scores(
             predicted_label=predicted_labels[index],
             expected_authorized=bool(expected_authorized[index]),
             condition=selected_conditions[index],
+            acceptance_eligible=bool(selected_eligibility[index]),
         )
         for index in range(len(sample_ids))
     )

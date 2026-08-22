@@ -33,12 +33,13 @@ from asher.ui.workers import FunctionWorker, QT_WORKERS_AVAILABLE
 
 try:
     from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QObject, QPropertyAnimation, QThreadPool, QTimer, Qt, Signal
-    from PySide6.QtGui import QColor, QFont, QIcon, QPalette
+    from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPalette, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
         QComboBox,
         QDoubleSpinBox,
+        QFileDialog,
         QFormLayout,
         QFrame,
         QGridLayout,
@@ -86,6 +87,7 @@ _COMPANION_ACTIVE_STATES = frozenset({
     AssistantState.WAKE_DETECTED,
     AssistantState.AUTHENTICATING,
     AssistantState.AUTHENTICATED,
+    AssistantState.LOCKED,
     AssistantState.LISTENING,
     AssistantState.TRANSCRIBING,
     AssistantState.THINKING,
@@ -282,6 +284,14 @@ else:
 
         def refresh_status(self, status: Any) -> None:
             self.orb.set_state(status.state)
+            # Called only by the Qt-thread status timer/result handlers. This
+            # scalar is real microphone RMS; synthetic speech is not animated.
+            microphone_level = (
+                getattr(status, "microphone_level", 0.0)
+                if status.microphone_active
+                else 0.0
+            )
+            self.orb.set_audio_level(microphone_level)
             self.state.setText(status.state.value.upper().replace("_", " "))
             self.status.setText(status.message or visual_for_state(status.state).label)
             self.listen_button.setText("Stop listening" if status.microphone_active else "Start listening")
@@ -311,6 +321,7 @@ else:
             self.window = window
             self.setObjectName("companionMode")
             root = QVBoxLayout(self)
+            self.root_layout = root
             root.setContentsMargins(24, 16, 24, 18)
             root.setSpacing(0)
 
@@ -326,13 +337,15 @@ else:
             stop.setToolTip("Emergency stop — cancel the active ASHER plan and voice output")
             stop.setMinimumWidth(74)
             stop.clicked.connect(window.emergency_stop)
+            self.stop_button = stop
             top.addWidget(stop)
+            self.top_layout = top
             root.addLayout(top)
 
             root.addStretch(1)
             self.orb = AsherOrbWidget(self)
             self.orb.set_cinematic_mode(True)
-            self.orb.set_interactive_resize(True, initial_size=760)
+            self.orb.set_interactive_resize(True, initial_size=700)
             self.orb.set_overlay_text("LISTENING", "")
             root.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
             root.addStretch(1)
@@ -355,19 +368,59 @@ else:
             self.confirm_summary = _label("", "companionMessage")
             self.confirm_summary.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             confirm_layout.addWidget(self.confirm_summary)
+            self.confirm_preview_label = _label("EXACT PREVIEW", "companionTelemetry")
+            self.confirm_preview_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            confirm_layout.addWidget(self.confirm_preview_label)
+            self.confirm_preview = QPlainTextEdit()
+            self.confirm_preview.setObjectName("companionPreview")
+            self.confirm_preview.setReadOnly(True)
+            self.confirm_preview.setAccessibleName("Exact pending action preview")
+            self.confirm_preview.setMinimumHeight(96)
+            self.confirm_preview.setMaximumHeight(150)
+            confirm_layout.addWidget(self.confirm_preview)
             actions = QHBoxLayout()
             actions.addStretch()
-            reject = QPushButton("Reject")
-            reject.clicked.connect(window.reject_pending)
+            cancel = QPushButton("Cancel")
+            cancel.clicked.connect(window.reject_pending)
             approve = QPushButton("Approve")
             approve.setObjectName("primary")
             approve.clicked.connect(window.approve_pending)
-            actions.addWidget(reject)
+            self.cancel_button = cancel
+            actions.addWidget(cancel)
             actions.addWidget(approve)
             actions.addStretch()
             confirm_layout.addLayout(actions)
             self.confirm.setVisible(False)
             root.addWidget(self.confirm, 0, Qt.AlignmentFlag.AlignHCenter)
+            QTimer.singleShot(0, self._fit_orb_to_viewport)
+
+        def _fit_orb_to_viewport(self) -> int:
+            """Keep the dominant square orb fully inside the live viewport."""
+
+            margins = self.root_layout.contentsMargins()
+            top_height = max(
+                self.brand.sizeHint().height(),
+                self.stop_button.sizeHint().height(),
+            )
+            confirmation_height = (
+                self.confirm.sizeHint().height() if not self.confirm.isHidden() else 0
+            )
+            available_width = self.width() - margins.left() - margins.right()
+            available_height = (
+                self.height()
+                - margins.top()
+                - margins.bottom()
+                - top_height
+                - confirmation_height
+                - 16
+            )
+            maximum = max(340, min(700, available_width, available_height))
+            self.orb.set_display_bounds(340, maximum)
+            return self.orb.set_display_size(maximum)
+
+        def resizeEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback
+            super().resizeEvent(event)
+            self._fit_orb_to_viewport()
 
         def set_state_event(self, event: Any) -> None:
             state = getattr(event, "state", None)
@@ -381,6 +434,12 @@ else:
 
         def refresh_status(self, status: Any) -> None:
             self.orb.set_state(status.state)
+            microphone_level = (
+                getattr(status, "microphone_level", 0.0)
+                if status.microphone_active
+                else 0.0
+            )
+            self.orb.set_audio_level(microphone_level)
             state_text = status.state.value.upper().replace("_", " ")
             message = status.message or visual_for_state(status.state).label
             self.state.setText(state_text)
@@ -398,11 +457,20 @@ else:
             self.confirm.setVisible(pending is not None)
             if pending is None:
                 self.confirm_summary.setText("")
+                self.confirm_preview.clear()
+                self._fit_orb_to_viewport()
                 return
             self.confirm_summary.setText(
                 f"{pending.action} · {pending.target} · {pending.effect} · "
                 f"{pending.risk.name.replace('_', ' ')}"
             )
+            # Render the complete preview as plain text so message/body fields
+            # remain visible and selectable without interpreting user-provided
+            # content as rich text or HTML.
+            self.confirm_preview.setPlainText(
+                json.dumps(dict(pending.preview), indent=2, ensure_ascii=False, sort_keys=True)
+            )
+            self._fit_orb_to_viewport()
 
 
     class ConversationPage(_Page):
@@ -510,9 +578,12 @@ else:
             delete = QPushButton("Delete selected")
             delete.setObjectName("dangerButton")
             delete.clicked.connect(window.delete_memory)
+            self.export_button = QPushButton("Export JSON")
+            self.export_button.clicked.connect(window.export_memories)
             row.addWidget(add)
             row.addWidget(edit)
             row.addWidget(delete)
+            row.addWidget(self.export_button)
             row.addStretch()
             layout.addLayout(row)
 
@@ -743,15 +814,24 @@ else:
             self._nav_buttons: list[QPushButton] = []
             self._pages: dict[str, QWidget] = {}
             self._state_unsubscribe: Callable[[], None] | None = None
+            self._pending_view_signature: object = object()
             self._state_bridge = _StateSignalBridge(self)
             self._state_bridge.state_event.connect(self._on_state_event)
             self._companion_fullscreen_active = False
+            self._companion_restore_pending = False
             self._restore_maximized_after_companion = False
+            self._restore_fullscreen_after_companion = False
             self.setWindowTitle("Asher — authenticated personal companion")
             self.setMinimumSize(1120, 720)
             self.resize(1320, 820)
             self.setStyleSheet(APP_STYLE)
             self._build_shell()
+            self._fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
+            self._fullscreen_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            self._fullscreen_shortcut.activated.connect(self._toggle_companion_fullscreen)
+            self._windowed_shortcut = QShortcut(QKeySequence("Esc"), self)
+            self._windowed_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            self._windowed_shortcut.activated.connect(self._leave_companion_fullscreen)
             subscribe = getattr(self.controller, "subscribe_state", None)
             if callable(subscribe):
                 self._state_unsubscribe = subscribe(self._state_bridge.state_event.emit)
@@ -807,6 +887,14 @@ else:
             header_layout.addWidget(self.header_offline)
             self.header_api = _label("API not configured", "statusChip")
             header_layout.addWidget(self.header_api)
+            self.header_session = _label("SESSION ACTIVE", "statusChip")
+            header_layout.addWidget(self.header_session)
+            self.reauthenticate_button = QPushButton("Re-authenticate")
+            self.reauthenticate_button.setToolTip(
+                "Use device authentication to create a fresh owner session"
+            )
+            self.reauthenticate_button.clicked.connect(self.reauthenticate_owner)
+            header_layout.addWidget(self.reauthenticate_button)
             stop = QPushButton("EMERGENCY STOP")
             stop.setObjectName("dangerButton")
             stop.setMinimumHeight(38)
@@ -860,19 +948,54 @@ else:
 
             if enabled:
                 self._restore_maximized_after_companion = self.isMaximized()
+                self._restore_fullscreen_after_companion = self.isFullScreen()
+                self._companion_restore_pending = self.isVisible()
                 self.mode_stack.setCurrentWidget(target)
-                if self.isVisible() and not self.isFullScreen():
-                    self.showFullScreen()
+                if self._companion_restore_pending:
+                    if not self.isFullScreen():
+                        self.showFullScreen()
                     self._companion_fullscreen_active = True
                 return
 
             self.mode_stack.setCurrentWidget(target)
-            if self._companion_fullscreen_active and self.isFullScreen():
-                if self._restore_maximized_after_companion:
+            if self._companion_restore_pending:
+                if self._restore_fullscreen_after_companion:
+                    self.showFullScreen()
+                elif self._restore_maximized_after_companion:
                     self.showMaximized()
                 else:
                     self.showNormal()
             self._companion_fullscreen_active = False
+            self._companion_restore_pending = False
+
+        def _leave_companion_fullscreen(self) -> bool:
+            """Reveal the regular resizable Companion window without ending it."""
+
+            if (
+                self.mode_stack.currentWidget() is not self.companion_mode
+                or not self.isFullScreen()
+            ):
+                return False
+            if (
+                self._restore_maximized_after_companion
+                and not self._restore_fullscreen_after_companion
+            ):
+                self.showMaximized()
+            else:
+                self.showNormal()
+            self._companion_fullscreen_active = False
+            return True
+
+        def _toggle_companion_fullscreen(self) -> bool:
+            """Toggle F11 presentation mode while preserving the active scene."""
+
+            if self.mode_stack.currentWidget() is not self.companion_mode:
+                return False
+            if self.isFullScreen():
+                return self._leave_companion_fullscreen()
+            self.showFullScreen()
+            self._companion_fullscreen_active = True
+            return True
 
         def _sync_mode_for_status(self, status: Any) -> None:
             self._set_companion_mode(
@@ -922,6 +1045,7 @@ else:
                 self.header_message.setText(message)
             try:
                 self._sync_mode_for_status(self.controller.status())
+                self._refresh_pending_views()
             except Exception:
                 pass
 
@@ -937,18 +1061,51 @@ else:
             self.header_message.setText(status.message)
             self.header_offline.setText("OFFLINE MODE" if status.offline else "LOCAL + API")
             self.header_api.setText("API configured" if status.api_configured else "API not configured")
+            self.header_session.setText(
+                "SESSION ACTIVE" if status.owner_session_active else "SESSION EXPIRED"
+            )
+            self.reauthenticate_button.setEnabled(not status.owner_session_active)
             self.reset_stop_button.setVisible(status.emergency_stopped)
             self.emergency_stop_button.setEnabled(not status.emergency_stopped)
             self.home.refresh_status(status)
             self.companion_mode.refresh_status(status)
             self._sync_mode_for_status(status)
+            try:
+                self._refresh_pending_views()
+            except Exception:
+                # Status and emergency controls must remain live even if an
+                # optional controller cannot enumerate confirmations.
+                pass
+
+        def _refresh_pending_views(self) -> None:
+            pending = self.controller.pending_action()
+            signature: object
+            if pending is None:
+                signature = None
+            else:
+                signature = (
+                    pending.confirmation_id,
+                    pending.action,
+                    pending.target,
+                    pending.effect,
+                    pending.risk,
+                    pending.expires_at,
+                    json.dumps(
+                        dict(pending.preview),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+            if signature == self._pending_view_signature:
+                return
+            self._pending_view_signature = signature
+            self.confirmation_page.refresh(pending)
+            self.companion_mode.refresh_pending(pending)
 
         def _refresh_views(self) -> None:
             try:
                 self.conversation_page.refresh(self.controller.conversation(), self.controller.live_steps())
-                pending = self.controller.pending_action()
-                self.confirmation_page.refresh(pending)
-                self.companion_mode.refresh_pending(pending)
+                self._refresh_pending_views()
                 self.memory_page.refresh(self.controller.list_memories())
                 self.users_page.refresh(self.controller.list_users())
                 self.permissions_page.refresh(self.controller.list_permissions())
@@ -1032,6 +1189,30 @@ else:
             answer = QMessageBox.question(self, "Delete memory", "Delete the selected memory? This cannot be undone.")
             if answer == QMessageBox.StandardButton.Yes:
                 self._run(self.controller.delete_memory, memory_id, on_result=lambda _result: self._refresh_views())
+
+        def export_memories(self) -> None:
+            destination, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Export local memories",
+                "asher-memories.json",
+                "JSON files (*.json)",
+            )
+            destination = destination.strip()
+            if not destination:
+                return
+            if not destination.casefold().endswith(".json"):
+                destination += ".json"
+            self._run(
+                self.controller.export_memories,
+                destination,
+                on_result=self._memory_export_result,
+            )
+
+        def _memory_export_result(self, _destination: Any) -> None:
+            self.header_message.setText(
+                "Memory export completed to the selected local JSON file."
+            )
+            self._refresh_views()
 
         def enroll_user(self) -> None:
             name, ok = QInputDialog.getText(self, "Enroll user", "Display name:")
@@ -1120,6 +1301,18 @@ else:
 
         def run_diagnostics(self) -> None:
             self._run(self.controller.run_diagnostics, on_result=self.diagnostics_page.refresh)
+
+        def reauthenticate_owner(self) -> None:
+            self._run(
+                self.controller.reauthenticate_owner,
+                on_result=self._reauthentication_result,
+            )
+
+        def _reauthentication_result(self, _status: Any) -> None:
+            self.header_message.setText(
+                "Owner session re-authenticated with device credentials."
+            )
+            self._refresh_views()
 
         def emergency_stop(self) -> None:
             self._run(self.controller.emergency_stop, on_result=lambda _result: self._refresh_views())

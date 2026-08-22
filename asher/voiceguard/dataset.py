@@ -12,7 +12,14 @@ from typing import Iterable, Sequence
 from .audio import sha256_file
 from .exceptions import DatasetError, ManifestError
 from .recording import MANIFEST_FILENAME, load_manifest
-from .schema import SampleCondition, SampleRecord, SessionManifest, SpeakerRole, TrainingTask
+from .schema import (
+    SampleCondition,
+    SampleOrigin,
+    SampleRecord,
+    SessionManifest,
+    SpeakerRole,
+    TrainingTask,
+)
 
 
 WAKE_POSITIVE = "wake_positive"
@@ -50,11 +57,20 @@ class DatasetSample:
         task: str | TrainingTask,
         authorized_labels: Sequence[str],
     ) -> bool:
-        if self.record.expected_authorized is not None:
-            return self.record.expected_authorized
+        selected_task = TrainingTask(task)
+        # Replay trials are attacks, even when they contain an enrolled
+        # speaker's voice.  A stale or hand-edited manifest flag must never
+        # turn a replay into an authorized calibration example.
         if self.record.condition == SampleCondition.REPLAY.value:
             return False
-        return self.label_for(task) in set(authorized_labels)
+        # The persisted annotation describes speaker authorization.  Wake-word
+        # authorization is task-specific and comes from the phrase label, so an
+        # owner's ordinary negative utterance must not become a wake positive.
+        if selected_task is TrainingTask.WAKE_WORD:
+            return self.label_for(selected_task) in set(authorized_labels)
+        if self.record.expected_authorized is not None:
+            return self.record.expected_authorized
+        return self.label_for(selected_task) in set(authorized_labels)
 
 
 @dataclass(frozen=True)
@@ -69,11 +85,42 @@ class VoiceDataset:
 
     @property
     def fingerprint(self) -> str:
-        """Hash non-secret sample identities and content digests for reproducibility."""
+        """Hash all training-relevant manifest metadata and verified content digests."""
 
         digest = hashlib.sha256()
+        for session in sorted(self.sessions, key=lambda item: item.session_id):
+            fields = (
+                "session",
+                session.session_id,
+                session.speaker_id,
+                session.role,
+                session.environment,
+                session.created_at,
+                session.consent_given_at,
+                session.finalized_at or "",
+                session.revoked_at or "",
+            )
+            digest.update("\0".join(fields).encode("utf-8"))
         for sample in sorted(self.samples, key=lambda item: (item.session_id, item.record.sample_id)):
-            fields = (sample.session_id, sample.record.sample_id, sample.record.sha256)
+            fields = (
+                "sample",
+                sample.session_id,
+                sample.speaker_id,
+                sample.role,
+                sample.environment,
+                sample.record.sample_id,
+                sample.record.sha256,
+                str(sample.record.contains_wake_phrase),
+                sample.record.condition,
+                sample.record.origin,
+                sample.record.created_at,
+                (
+                    "unset"
+                    if sample.record.expected_authorized is None
+                    else str(sample.record.expected_authorized)
+                ),
+                sample.record.source_sample_id or "",
+            )
             digest.update("\0".join(fields).encode("utf-8"))
         return digest.hexdigest()
 
@@ -86,6 +133,8 @@ class FeatureExample:
     features: tuple[float, ...]
     expected_authorized: bool
     condition: str = SampleCondition.CLEAN.value
+    origin: str = SampleOrigin.RECORDED.value
+    source_sample_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.sample_id or not self.session_id or not self.label:
@@ -94,6 +143,16 @@ class FeatureExample:
             raise DatasetError("feature vectors cannot be empty")
         if self.condition not in {item.value for item in SampleCondition}:
             raise DatasetError("feature example has an unsupported evaluation condition")
+        if self.origin not in {item.value for item in SampleOrigin}:
+            raise DatasetError("feature example has an unsupported sample origin")
+        if self.origin == SampleOrigin.AUGMENTED.value and not self.source_sample_id:
+            raise DatasetError("augmented feature examples require an explicit source sample")
+        if self.origin != SampleOrigin.AUGMENTED.value and self.source_sample_id is not None:
+            raise DatasetError("only augmented feature examples may reference a source sample")
+
+    @property
+    def is_augmented(self) -> bool:
+        return self.origin == SampleOrigin.AUGMENTED.value
 
 
 @dataclass(frozen=True)
@@ -125,26 +184,49 @@ def load_dataset(
     *,
     include_revoked: bool = False,
     verify_checksums: bool = True,
+    session_ids: Iterable[str] | None = None,
 ) -> VoiceDataset:
     """Load manifest-owned WAV samples without searching or printing private contents."""
 
     root = Path(recordings_root).resolve()
-    if not root.exists():
+    selected_ids: tuple[str, ...] | None = None
+    if session_ids is not None:
+        selected_ids = tuple(sorted(set(str(item) for item in session_ids)))
+        for session_id in selected_ids:
+            if (
+                not session_id
+                or session_id.strip() != session_id
+                or any(char in session_id for char in "/\\\x00")
+                or Path(session_id).name != session_id
+            ):
+                raise DatasetError("registered session identifiers must be path-free")
+    if not root.exists() and selected_ids == ():
+        return VoiceDataset(root=root, sessions=(), samples=())
+    if not root.is_dir():
         raise DatasetError("recordings directory does not exist")
+
+    if selected_ids is None:
+        manifest_paths = tuple(sorted(root.glob(f"*/{MANIFEST_FILENAME}")))
+    else:
+        manifest_paths = tuple(root / session_id / MANIFEST_FILENAME for session_id in selected_ids)
+
     sessions: list[SessionManifest] = []
     samples: list[DatasetSample] = []
-    for manifest_path in sorted(root.glob(f"*/{MANIFEST_FILENAME}")):
+    for manifest_path in manifest_paths:
         session_directory = manifest_path.parent
         resolved_session_directory = session_directory.resolve()
         if (
             session_directory.is_symlink()
             or resolved_session_directory.parent != root
+            or manifest_path.is_symlink()
         ):
             raise DatasetError("recording session path escaped the recordings directory")
+        if not manifest_path.is_file():
+            raise DatasetError("a registered recording manifest is missing")
         try:
             manifest = load_manifest(manifest_path)
         except ManifestError as exc:
-            raise DatasetError(f"invalid recording manifest in session directory {manifest_path.parent.name}") from exc
+            raise DatasetError("a finalized recording manifest is invalid") from exc
         if session_directory.name != manifest.session_id:
             raise DatasetError("recording manifest does not match its session directory")
         if manifest.revoked and not include_revoked:

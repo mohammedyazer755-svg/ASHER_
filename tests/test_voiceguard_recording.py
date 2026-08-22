@@ -15,6 +15,7 @@ from asher.voiceguard import (
     PcmAudio,
     RecordingSession,
     SampleCondition,
+    SampleOrigin,
     augment_audio,
     augment_session,
     load_dataset,
@@ -96,6 +97,57 @@ class VoiceGuardRecordingTests(unittest.TestCase):
             session.manifest_path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaises(Exception):
                 load_manifest(session.directory)
+
+    def test_manifest_rejects_string_booleans(self) -> None:
+        with TemporaryDirectory() as temporary:
+            session = RecordingSession.create(
+                Path(temporary) / "recordings",
+                speaker_id="fixture-owner",
+                role="owner",
+                environment="test-room",
+                consent=True,
+                session_id="session-strict-booleans",
+            )
+            session.add_pcm16(
+                [1000, -1000] * 32,
+                contains_wake_phrase=False,
+                expected_authorized=False,
+                sample_id="strict-sample",
+            )
+            original = json.loads(session.manifest_path.read_text(encoding="utf-8"))
+            for field in ("contains_wake_phrase", "expected_authorized"):
+                with self.subTest(field=field):
+                    value = json.loads(json.dumps(original))
+                    value["samples"][0][field] = "false"
+                    session.manifest_path.write_text(json.dumps(value), encoding="utf-8")
+                    with self.assertRaises(Exception):
+                        load_manifest(session.directory)
+
+    def test_augmentation_must_preserve_source_wake_and_authorization_labels(self) -> None:
+        with TemporaryDirectory() as temporary:
+            session = RecordingSession.create(
+                Path(temporary) / "recordings",
+                speaker_id="fixture-owner",
+                role="owner",
+                environment="test-room",
+                consent=True,
+                session_id="session-label-binding",
+            )
+            source = session.add_pcm16(
+                [1000, -1000] * 32,
+                contains_wake_phrase=True,
+                expected_authorized=True,
+                sample_id="source-sample",
+            )
+            with self.assertRaises(Exception):
+                session.add_pcm16(
+                    [900, -900] * 32,
+                    contains_wake_phrase=False,
+                    expected_authorized=False,
+                    origin=SampleOrigin.AUGMENTED,
+                    source_sample_id=source.sample_id,
+                    sample_id="mislabeled-augmentation",
+                )
 
     def test_augmentation_is_deterministic_and_tagged_noisy(self) -> None:
         audio = PcmAudio(tuple([1000, -500] * 400))

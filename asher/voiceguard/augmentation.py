@@ -89,7 +89,12 @@ def augment_session(
     eligible_origins = {SampleOrigin.RECORDED.value}
     if include_imported:
         eligible_origins.add(SampleOrigin.IMPORTED.value)
-    sources = tuple(sample for sample in session.manifest.samples if sample.origin in eligible_origins)
+    sources = tuple(
+        sample
+        for sample in session.manifest.samples
+        if sample.origin in eligible_origins
+        and sample.condition != SampleCondition.REPLAY.value
+    )
     created: list[SampleRecord] = []
     for source in sources:
         source_path = session.manifest.resolve_sample_path(session.directory, source)

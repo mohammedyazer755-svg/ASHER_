@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -78,6 +78,55 @@ class MemoryStore:
     def __init__(self, database: Database) -> None:
         self.database = database
 
+    def _setting(self, key: str, default: str) -> str:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key=?",
+                (key,),
+            ).fetchone()
+        return default if row is None else str(row["setting_value"])
+
+    @property
+    def enabled(self) -> bool:
+        return self._setting("memory_enabled", "true").casefold() == "true"
+
+    @property
+    def retention_days(self) -> int:
+        try:
+            value = int(self._setting("memory_retention_days", "0"))
+        except ValueError:
+            return 0
+        return value if 0 <= value <= 3650 else 0
+
+    def configure(self, *, enabled: bool, retention_days: int) -> None:
+        if isinstance(retention_days, bool) or not 0 <= int(retention_days) <= 3650:
+            raise ValueError("memory retention must be between 0 and 3650 days")
+        now = datetime.now(UTC).isoformat()
+        values = {
+            "memory_enabled": "true" if bool(enabled) else "false",
+            "memory_retention_days": str(int(retention_days)),
+        }
+        with self.database.transaction() as connection:
+            for key, value in values.items():
+                connection.execute(
+                    "INSERT INTO app_settings(setting_key, setting_value, updated_at) "
+                    "VALUES(?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET "
+                    "setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+                    (key, value, now),
+                )
+
+    def _require_enabled(self) -> None:
+        if not self.enabled:
+            raise PermissionError(
+                "Long-term memory is disabled in local privacy settings"
+            )
+
+    def _retained_until(self, supplied: datetime | None) -> datetime | None:
+        if supplied is not None:
+            return supplied
+        days = self.retention_days
+        return datetime.now(UTC) + timedelta(days=days) if days else None
+
     @staticmethod
     def _can_access(requester: Actor, owner_id: str, capability: str) -> bool:
         if requester.role is Role.OWNER and requester.user_id == owner_id:
@@ -116,6 +165,7 @@ class MemoryStore:
         confirmed: bool = False,
         expires_at: datetime | None = None,
     ) -> MemoryRecord:
+        self._require_enabled()
         if not self._can_access(requester, owner_id, "memory.write"):
             raise PermissionError("Private memory access denied")
         if not confirmed:
@@ -137,6 +187,7 @@ class MemoryStore:
             raise ValueError("Passwords, PINs, API keys, tokens, and credentials cannot be stored")
 
         now = datetime.now(UTC)
+        expires_at = self._retained_until(expires_at)
         memory_id = uuid4().hex
         with self.database.transaction() as connection:
             existing = connection.execute(
@@ -207,6 +258,7 @@ class MemoryStore:
         references held by callers.
         """
 
+        self._require_enabled()
         current = self.get(requester, memory_id)
         if current is None:
             raise KeyError("Memory was not found")
@@ -230,6 +282,7 @@ class MemoryStore:
             raise ValueError("Passwords, PINs, API keys, tokens, and credentials cannot be stored")
 
         now = datetime.now(UTC)
+        expires_at = self._retained_until(expires_at)
         try:
             with self.database.transaction() as connection:
                 duplicate = connection.execute(

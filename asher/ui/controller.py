@@ -14,6 +14,7 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -53,6 +54,10 @@ class DesktopStatus:
     api_configured: bool
     emergency_stopped: bool
     microphone_active: bool = False
+    owner_session_active: bool = True
+    # Presentation-only normalized RMS from real microphone frames. TTS never
+    # fabricates this signal and raw PCM is never stored in desktop status.
+    microphone_level: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +175,10 @@ class DesktopControllerProtocol(Protocol):
     def update_memory(self, memory_id: str, value: str, memory_type: str = "semantic", sensitivity: str = "private", consented: bool = False) -> MemoryRecord: ...
 
     def delete_memory(self, memory_id: str) -> bool: ...
+
+    def export_memories(self, destination: str | Path) -> Path: ...
+
+    def reauthenticate_owner(self) -> DesktopStatus: ...
 
     def list_users(self) -> tuple[UserRecord, ...]: ...
 
@@ -477,6 +486,20 @@ class DesktopController:
                 return False
             self._record("memory_delete", "complete", memory_id=memory_id)
             return True
+
+    def export_memories(self, destination: str | Path) -> Path:
+        """Fail closed when the authenticated persistent backend is absent."""
+
+        raise ControllerUnavailable(
+            "Memory export requires the authenticated persistent companion controller"
+        )
+
+    def reauthenticate_owner(self) -> DesktopStatus:
+        """Fail closed when no persistent owner/device-auth backend is present."""
+
+        raise ControllerUnavailable(
+            "Owner re-authentication requires the persistent companion controller"
+        )
 
     def list_users(self) -> tuple[UserRecord, ...]:
         with self._lock:

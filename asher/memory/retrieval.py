@@ -37,6 +37,8 @@ class MemoryRetriever:
         limit: int = 5,
         include_sensitive: bool = False,
     ) -> list[RetrievedMemory]:
+        if not self.store.enabled:
+            return []
         query_tokens = _tokens(query)
         if not query_tokens:
             return []
@@ -58,4 +60,3 @@ class MemoryRetriever:
                 scored.append(RetrievedMemory(record, score))
         scored.sort(key=lambda item: item.score, reverse=True)
         return scored[: max(1, min(limit, 10))]
-

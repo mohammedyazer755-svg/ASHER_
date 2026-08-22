@@ -44,4 +44,4 @@ try {
     if ($null -eq $savedQtPlatform) { Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue } else { $env:QT_QPA_PLATFORM = $savedQtPlatform }
 }
 
-Write-Host 'All requested checks completed.' -ForegroundColor Green
+Write-Host 'All requested checks completed.' -ForegroundColor Green 

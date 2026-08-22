@@ -1,9 +1,10 @@
-"""Guided local VoiceGuard speaker-auth dataset collection.
+"""Guided local VoiceGuard speaker-auth and wake-word data collection.
 
 This helper records one *session* containing several short clips. Re-run it in
 separate environments/times so VoiceGuard can keep train/validation/test data
 session-separated. Raw audio remains inside ASHER's private runtime directory
-and is never printed.
+and is never printed. Wake labels describe the literal guided prompt; this
+collector does not claim synthetic, noisy, or replay conditions.
 """
 
 from __future__ import annotations
@@ -18,7 +19,14 @@ from dotenv import load_dotenv
 from asher.config import AsherConfig
 from asher.security.users import UserStore
 from asher.storage import Database
-from asher.voiceguard import EnrollmentManager, SpeakerRole
+from asher.voiceguard import (
+    EnrollmentManager,
+    SpeakerRole,
+    TrainingConfig,
+    TrainingReadiness,
+    TrainingTask,
+    VoiceGuardError,
+)
 
 
 DEFAULT_PROMPTS = (
@@ -29,6 +37,17 @@ DEFAULT_PROMPTS = (
     "Read the next task on my list.",
     "Close the current window.",
 )
+
+WAKE_POSITIVE_PROMPTS = (
+    "Hey Asher.",
+    "Hey Asher, open Chrome.",
+    "Hey Asher, what is next on my list?",
+    "Hey Asher, turn the volume down.",
+    "Hey Asher, read today's notes.",
+    "Hey Asher, go to standby.",
+)
+
+WAKE_NEGATIVE_PROMPTS = DEFAULT_PROMPTS
 
 
 @dataclass(frozen=True)
@@ -41,7 +60,18 @@ class CollectionIdentity:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Collect one consented multi-clip VoiceGuard speaker-auth session"
+        description="Collect one consented multi-clip VoiceGuard session"
+    )
+    parser.add_argument(
+        "--task",
+        choices=(TrainingTask.SPEAKER_AUTH.value, TrainingTask.WAKE_WORD.value),
+        default=TrainingTask.SPEAKER_AUTH.value,
+        help="Collect speaker identity clips or explicitly labelled wake-word clips",
+    )
+    parser.add_argument(
+        "--wake-label",
+        choices=("positive", "negative"),
+        help="Required for --task wake_word; whether every guided prompt contains 'Hey Asher'",
     )
     parser.add_argument(
         "--speaker",
@@ -88,6 +118,29 @@ def validate_collection_settings(samples: int, duration: float, environment: str
         raise ValueError("--environment must not be empty")
 
 
+def collection_prompt_plan(
+    task: str,
+    wake_label: str | None,
+) -> tuple[tuple[str, ...], bool]:
+    """Return honest prompts and the literal manifest wake-phrase label."""
+
+    try:
+        selected = TrainingTask(task)
+    except ValueError as exc:
+        raise ValueError("--task must be speaker_auth or wake_word") from exc
+    if selected is TrainingTask.SPEAKER_AUTH:
+        if wake_label is not None:
+            raise ValueError("--wake-label is only valid with --task wake_word")
+        return DEFAULT_PROMPTS, False
+    if wake_label is None:
+        raise ValueError("--wake-label is required with --task wake_word")
+    if wake_label == "positive":
+        return WAKE_POSITIVE_PROMPTS, True
+    if wake_label == "negative":
+        return WAKE_NEGATIVE_PROMPTS, False
+    raise ValueError("--wake-label must be positive or negative")
+
+
 def collect_session(
     manager: EnrollmentManager,
     identity: CollectionIdentity,
@@ -95,6 +148,8 @@ def collect_session(
     environment: str,
     samples: int,
     duration: float,
+    task: str = TrainingTask.SPEAKER_AUTH.value,
+    wake_label: str | None = None,
     device: int | str | None = None,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
@@ -102,6 +157,7 @@ def collect_session(
     """Record one leakage-safe session after consent was already established."""
 
     validate_collection_settings(samples, duration, environment)
+    prompts, contains_wake_phrase = collection_prompt_plan(task, wake_label)
     session = manager.begin_enrollment(
         identity.speaker_id,
         role=identity.role,
@@ -109,14 +165,18 @@ def collect_session(
         consent=True,
     )
     try:
-        output_fn(f"Collecting {samples} private clips for {identity.display_name}.")
+        label_suffix = f" ({wake_label})" if wake_label is not None else ""
+        output_fn(
+            f"Collecting {samples} private {task}{label_suffix} clips for "
+            f"{identity.display_name}."
+        )
         output_fn("Each clip starts immediately after you press Enter. Raw audio is not printed.")
         for index in range(samples):
-            prompt = DEFAULT_PROMPTS[index % len(DEFAULT_PROMPTS)]
+            prompt = prompts[index % len(prompts)]
             input_fn(f"[{index + 1}/{samples}] Say: {prompt!r}  Press Enter when ready...")
             session.record_microphone(
                 duration,
-                contains_wake_phrase=False,
+                contains_wake_phrase=contains_wake_phrase,
                 expected_authorized=identity.expected_authorized,
                 device=device,
             )
@@ -141,6 +201,14 @@ def _parse_device(raw: str | None) -> int | str | None:
         return value
 
 
+def readiness_summary(readiness: TrainingReadiness) -> str:
+    state = "READY" if readiness.ready else "NOT READY"
+    return (
+        f"VoiceGuard dataset: {state}; sessions={readiness.session_count}, "
+        f"samples={readiness.sample_count}, classes={readiness.class_count}."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
@@ -150,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     try:
         validate_collection_settings(args.samples, args.duration, args.environment)
+        collection_prompt_plan(args.task, args.wake_label)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -162,13 +231,28 @@ def main(argv: list[str] | None = None) -> int:
         environment=args.environment,
         samples=args.samples,
         duration=args.duration,
+        task=args.task,
+        wake_label=args.wake_label,
         device=_parse_device(args.device),
     )
+    label_suffix = f", wake_label={args.wake_label}" if args.wake_label else ""
     print(
-        f"VoiceGuard session complete: speaker={args.speaker}, clips={args.samples}, "
+        f"VoiceGuard session complete: task={args.task}{label_suffix}, "
+        f"speaker={args.speaker}, clips={args.samples}, "
         f"registered_sessions={total_sessions}."
     )
-    print("Session-separated evaluation needs repeated sessions recorded at different times/environments.")
+    try:
+        readiness = manager.assess_training_readiness(
+            config=TrainingConfig(task=args.task)
+        )
+    except VoiceGuardError as exc:
+        print(f"Dataset readiness could not be checked safely: {exc}")
+    else:
+        print(readiness_summary(readiness))
+    print(
+        f"Run `python train_voiceguard.py --task {args.task} --check` for aggregate requirements. "
+        "Session-separated evaluation needs repeated sessions recorded at different times/environments."
+    )
     print("Do not upload the private WAV files; keep them local to ASHER.")
     return 0
 

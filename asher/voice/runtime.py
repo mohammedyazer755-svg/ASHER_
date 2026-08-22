@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import io
+import array
 import json
+import math
 import os
+import sys
 import tempfile
 import threading
 import time
 import wave
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -38,6 +42,26 @@ SLEEP_COMMANDS = frozenset(
 )
 
 
+def normalized_pcm16_rms(pcm16: bytes | bytearray | memoryview) -> float:
+    """Return bounded RMS for little-endian signed PCM16 without retaining it."""
+
+    try:
+        raw = memoryview(pcm16).cast("B")
+        usable_bytes = raw.nbytes - (raw.nbytes % 2)
+        if usable_bytes <= 0:
+            return 0.0
+        samples = array.array("h")
+        samples.frombytes(raw[:usable_bytes])
+        if sys.byteorder != "little":
+            samples.byteswap()
+    except (TypeError, ValueError, BufferError):
+        return 0.0
+    if not samples:
+        return 0.0
+    mean_square = sum(int(sample) * int(sample) for sample in samples) / len(samples)
+    return max(0.0, min(1.0, math.sqrt(mean_square) / 32768.0))
+
+
 class AudioBackend(Protocol):
     def frames(self, cancellation: CancellationToken | None = None): ...
 
@@ -45,7 +69,13 @@ class AudioBackend(Protocol):
 class SoundDeviceBackend:
     """16 kHz mono PCM stream with no recording retained beyond the turn."""
 
-    def __init__(self, *, sample_rate: int = 16_000, block_samples: int = 320, device: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 16_000,
+        block_samples: int = 320,
+        device: int | str | None = None,
+    ) -> None:
         self.sample_rate = sample_rate
         self.block_samples = block_samples
         self.device = device
@@ -131,28 +161,138 @@ class VoiceGuardVerifier(Protocol):
     def authenticate(self, pcm16: bytes, sample_rate: int) -> tuple[str | None, float, str]: ...
 
 
+class WakeWordVerifier(Protocol):
+    def verify(self, pcm16: bytes, sample_rate: int) -> tuple[bool, float, str]: ...
+
+
 class FileVoiceGuardVerifier:
     """Inference adapter that deletes temporary audio immediately."""
 
-    def __init__(self, model_path: str | Path, label_to_user: dict[str, str], *, extractor: Any, temp_root: str | Path | None = None) -> None:
-        self.model_path = Path(model_path)
+    def __init__(
+        self,
+        model_path: str | Path,
+        label_to_user: dict[str, str],
+        *,
+        extractor: Any,
+        temp_root: str | Path | None = None,
+        registry_path: str | Path | None = None,
+        required_enrollments: set[str] | None = None,
+        expected_dataset_fingerprint: str | None = None,
+        expected_model_content_fingerprint: str | None = None,
+    ) -> None:
+        self.model_path = Path(model_path).resolve()
         self.label_to_user = dict(label_to_user)
         self.extractor = extractor
         self.temp_root = Path(temp_root) if temp_root else None
+        self.registry_path = Path(registry_path).resolve() if registry_path else None
+        self.required_enrollments = frozenset(required_enrollments or ())
+        self.expected_dataset_fingerprint = expected_dataset_fingerprint
+        self.expected_model_content_fingerprint = expected_model_content_fingerprint
         self._model: Any | None = None
+
+    def _binding_is_current(self) -> bool:
+        if self.registry_path is None:
+            return True
+        try:
+            with self.registry_path.open("r", encoding="utf-8") as stream:
+                registry = json.load(stream)
+            if not isinstance(registry, Mapping):
+                return False
+            active_model = registry.get("active_model")
+            if not isinstance(active_model, str) or Path(active_model).expanduser().resolve() != self.model_path:
+                return False
+            dataset_fingerprint = registry.get("active_model_dataset_fingerprint")
+            content_fingerprint = registry.get("active_model_content_fingerprint")
+            if (
+                not self.expected_dataset_fingerprint
+                or dataset_fingerprint != self.expected_dataset_fingerprint
+                or not self.expected_model_content_fingerprint
+                or content_fingerprint != self.expected_model_content_fingerprint
+                or not self.model_path.is_file()
+            ):
+                return False
+            users = registry.get("users")
+            if not isinstance(users, Mapping):
+                return False
+            active_enrollments = {
+                str(key)
+                for key, value in users.items()
+                if isinstance(value, Mapping)
+                and value.get("user_id") == str(key)
+                and value.get("role") in {"owner", "trusted"}
+                and value.get("revoked_at") is None
+            }
+            if not self.required_enrollments.issubset(active_enrollments):
+                return False
+
+            from asher.voiceguard.enrollment import EnrollmentManager
+            from asher.voiceguard.model import (
+                CalibratedVoiceGuardModel,
+                model_content_fingerprint,
+            )
+
+            current_model = CalibratedVoiceGuardModel.load(self.model_path)
+            if (
+                current_model.model_version != self.expected_model_content_fingerprint
+                or model_content_fingerprint(current_model)
+                != self.expected_model_content_fingerprint
+            ):
+                return False
+            current_dataset = EnrollmentManager(
+                self.registry_path.parent
+            ).load_training_dataset()
+            return current_dataset.fingerprint == self.expected_dataset_fingerprint
+        except Exception:
+            return False
+
+    def _model_matches_expected_content(self, model: Any) -> bool:
+        """Validate the exact in-memory model that will perform inference."""
+
+        if self.expected_model_content_fingerprint is None:
+            return True
+        try:
+            from asher.voiceguard.model import (
+                CalibratedVoiceGuardModel,
+                model_content_fingerprint,
+            )
+
+            return (
+                isinstance(model, CalibratedVoiceGuardModel)
+                and model.task == "speaker_auth"
+                and model.model_version == self.expected_model_content_fingerprint
+                and model_content_fingerprint(model)
+                == self.expected_model_content_fingerprint
+            )
+        except Exception:
+            return False
 
     def authenticate(self, pcm16: bytes, sample_rate: int) -> tuple[str | None, float, str]:
         from asher.voiceguard.model import CalibratedVoiceGuardModel
 
-        if self._model is None:
-            self._model = CalibratedVoiceGuardModel.load(self.model_path)
+        if not self._binding_is_current():
+            return None, 0.0, "VoiceGuard enrollment or active model changed; guest access only"
+        candidate = self._model
+        if candidate is None:
+            try:
+                candidate = CalibratedVoiceGuardModel.load(self.model_path)
+            except Exception:
+                return None, 0.0, "VoiceGuard enrollment or active model changed; guest access only"
+        if not self._model_matches_expected_content(candidate):
+            self._model = None
+            return None, 0.0, "VoiceGuard enrollment or active model changed; guest access only"
+        self._model = candidate
         self.temp_root and self.temp_root.mkdir(parents=True, exist_ok=True)
         handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=self.temp_root)
         path = Path(handle.name)
         handle.close()
         try:
             _write_wav(path, pcm16, sample_rate)
-            result = self._model.verify_wav(path, self.extractor)
+            result = candidate.verify_wav(path, self.extractor)
+            if (
+                not self._model_matches_expected_content(candidate)
+                or not self._binding_is_current()
+            ):
+                return None, 0.0, "VoiceGuard enrollment or active model changed; guest access only"
             user_id = self.label_to_user.get(result.predicted_label) if result.accepted else None
             return user_id, result.score, result.reason
         finally:
@@ -176,6 +316,15 @@ def load_active_voiceguard_verifier(controller: CompanionController) -> FileVoic
         model_value = registry.get("active_model") if isinstance(registry, dict) else None
         if not isinstance(model_value, str) or not model_value.strip():
             return None
+        dataset_fingerprint = registry.get("active_model_dataset_fingerprint")
+        content_fingerprint = registry.get("active_model_content_fingerprint")
+        if (
+            not isinstance(dataset_fingerprint, str)
+            or len(dataset_fingerprint) != 64
+            or not isinstance(content_fingerprint, str)
+            or len(content_fingerprint) != 64
+        ):
+            return None
         model_path = Path(model_value).expanduser().resolve()
         models_root = (root / "models").resolve()
         if model_path != models_root and models_root not in model_path.parents:
@@ -184,18 +333,53 @@ def load_active_voiceguard_verifier(controller: CompanionController) -> FileVoic
             return None
 
         from asher.voiceguard.features import StatisticalFeatureExtractor
-        from asher.voiceguard.model import CalibratedVoiceGuardModel
+        from asher.voiceguard.enrollment import EnrollmentManager
+        from asher.voiceguard.model import (
+            CalibratedVoiceGuardModel,
+            model_content_fingerprint,
+        )
 
         model = CalibratedVoiceGuardModel.load(model_path)
-        if model.task != "speaker_auth":
+        if (
+            model.task != "speaker_auth"
+            or model.model_version != content_fingerprint
+            or model_content_fingerprint(model) != content_fingerprint
+        ):
             return None
+        dataset = EnrollmentManager(root).load_training_dataset()
+        if dataset.fingerprint != dataset_fingerprint:
+            return None
+        registry_users = registry.get("users")
+        if not isinstance(registry_users, Mapping):
+            return None
+        active_voice_enrollments: set[str] = set()
+        for registry_key, value in registry_users.items():
+            if not isinstance(value, Mapping):
+                return None
+            user_id = value.get("user_id")
+            role = value.get("role")
+            session_ids = value.get("session_ids")
+            if (
+                not isinstance(user_id, str)
+                or user_id != str(registry_key)
+                or role not in {"owner", "trusted", "unknown"}
+                or not isinstance(session_ids, list)
+                or any(not isinstance(item, str) or not item for item in session_ids)
+            ):
+                return None
+            if value.get("revoked_at") is None and role in {"owner", "trusted"}:
+                active_voice_enrollments.add(user_id)
         active = {
             actor.user_id: actor
             for actor in controller.users.list_active()
             if actor.role.value in {"owner", "trusted"}
         }
         authorized = set(model.authorized_labels)
-        if not authorized or not authorized.issubset(active):
+        if (
+            not authorized
+            or not authorized.issubset(active)
+            or not authorized.issubset(active_voice_enrollments)
+        ):
             return None
         extractor = StatisticalFeatureExtractor()
         if extractor.metadata.extractor_id != model.extractor_metadata.extractor_id:
@@ -205,11 +389,282 @@ def load_active_voiceguard_verifier(controller: CompanionController) -> FileVoic
             {label: label for label in model.classes if label in active},
             extractor=extractor,
             temp_root=controller.config.runtime.root / "voiceguard" / "tmp",
+            registry_path=registry_path,
+            required_enrollments=authorized,
+            expected_dataset_fingerprint=dataset_fingerprint,
+            expected_model_content_fingerprint=content_fingerprint,
         )
     except Exception:
         # A missing/corrupt/stale model must degrade to guest access, never to
         # an optimistic owner session.
         return None
+
+
+_WAKE_WORD_REGISTRY_KEYS = frozenset(
+    {
+        "wake_word_model",
+        "wake_word_model_dataset_fingerprint",
+        "wake_word_model_content_fingerprint",
+    }
+)
+_WAKE_WORD_CLASSES = frozenset({"wake_negative", "wake_positive"})
+_WAKE_WORD_AUTHORIZED_LABELS = frozenset({"wake_positive"})
+_WAKE_BINDING_REJECTED = (
+    "The active wake-word model is unavailable, stale, or no longer bound to the current dataset"
+)
+
+
+def _registry_has_no_active_wake_artifact(registry_path: Path) -> bool:
+    """Prove that transcript-only fallback is still allowed at decision time."""
+
+    try:
+        with registry_path.open("r", encoding="utf-8") as stream:
+            registry = json.load(stream)
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+    return isinstance(registry, Mapping) and not any(
+        key in registry for key in _WAKE_WORD_REGISTRY_KEYS
+    )
+
+
+@dataclass(frozen=True)
+class WakeWordModelBinding:
+    """A registry-backed standby gate with an explicit no-model fallback.
+
+    Transcript-only matching is allowed only when the registry proves that no
+    wake artifact is active.  A partial, corrupt, stale, or otherwise invalid
+    active binding is represented by ``active_artifact=True`` with no verifier
+    and always rejects activation.
+    """
+
+    active_artifact: bool
+    verifier: WakeWordVerifier | None = None
+    registry_path: Path | None = None
+    reason: str = _WAKE_BINDING_REJECTED
+
+    def verify(self, pcm16: bytes, sample_rate: int) -> tuple[bool, float | None, str]:
+        if self.active_artifact:
+            if self.verifier is None:
+                return False, 0.0, self.reason
+            try:
+                return self.verifier.verify(pcm16, sample_rate)
+            except Exception:
+                return False, 0.0, _WAKE_BINDING_REJECTED
+        if self.registry_path is not None and not _registry_has_no_active_wake_artifact(
+            self.registry_path
+        ):
+            return False, 0.0, _WAKE_BINDING_REJECTED
+        return True, None, "No active trained wake-word artifact; transcript boundary matched"
+
+
+class FileWakeWordVerifier:
+    """Inference adapter for a content- and dataset-bound wake-word model."""
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        extractor: Any,
+        temp_root: str | Path | None = None,
+        registry_path: str | Path | None = None,
+        expected_dataset_fingerprint: str | None = None,
+        expected_model_content_fingerprint: str | None = None,
+    ) -> None:
+        self.model_path = Path(model_path).resolve()
+        self.extractor = extractor
+        self.temp_root = Path(temp_root) if temp_root else None
+        self.registry_path = Path(registry_path).resolve() if registry_path else None
+        self.expected_dataset_fingerprint = expected_dataset_fingerprint
+        self.expected_model_content_fingerprint = expected_model_content_fingerprint
+        self._model: Any | None = None
+
+    def _model_matches_expected_content(self, model: Any) -> bool:
+        try:
+            from asher.voiceguard.model import (
+                CalibratedVoiceGuardModel,
+                model_content_fingerprint,
+            )
+
+            if not isinstance(model, CalibratedVoiceGuardModel):
+                return False
+            if (
+                model.task != "wake_word"
+                or set(model.classes) != _WAKE_WORD_CLASSES
+                or set(model.authorized_labels) != _WAKE_WORD_AUTHORIZED_LABELS
+                or model.extractor_metadata.extractor_id
+                != self.extractor.metadata.extractor_id
+            ):
+                return False
+            if (
+                len(model.coefficients) == 1
+                and model.binary_positive_class != "wake_positive"
+            ):
+                return False
+            if self.expected_model_content_fingerprint is None:
+                return True
+            return (
+                model.model_version == self.expected_model_content_fingerprint
+                and model_content_fingerprint(model)
+                == self.expected_model_content_fingerprint
+            )
+        except Exception:
+            return False
+
+    def _binding_is_current(self) -> bool:
+        if self.registry_path is None:
+            return True
+        try:
+            with self.registry_path.open("r", encoding="utf-8") as stream:
+                registry = json.load(stream)
+            if not isinstance(registry, Mapping):
+                return False
+            active_model = registry.get("wake_word_model")
+            if (
+                not isinstance(active_model, str)
+                or Path(active_model).expanduser().resolve() != self.model_path
+                or registry.get("wake_word_model_dataset_fingerprint")
+                != self.expected_dataset_fingerprint
+                or registry.get("wake_word_model_content_fingerprint")
+                != self.expected_model_content_fingerprint
+                or not self.expected_dataset_fingerprint
+                or not self.expected_model_content_fingerprint
+                or not self.model_path.is_file()
+            ):
+                return False
+
+            from asher.voiceguard.enrollment import EnrollmentManager
+            from asher.voiceguard.model import CalibratedVoiceGuardModel
+
+            current_model = CalibratedVoiceGuardModel.load(self.model_path)
+            if not self._model_matches_expected_content(current_model):
+                return False
+            current_dataset = EnrollmentManager(
+                self.registry_path.parent
+            ).load_training_dataset()
+            return current_dataset.fingerprint == self.expected_dataset_fingerprint
+        except Exception:
+            return False
+
+    def verify(self, pcm16: bytes, sample_rate: int) -> tuple[bool, float, str]:
+        """Verify one transient turn, rejecting every lifecycle/model error."""
+
+        from asher.voiceguard.model import CalibratedVoiceGuardModel
+
+        if not self._binding_is_current():
+            return False, 0.0, _WAKE_BINDING_REJECTED
+        candidate = self._model
+        if candidate is None:
+            try:
+                candidate = CalibratedVoiceGuardModel.load(self.model_path)
+            except Exception:
+                return False, 0.0, _WAKE_BINDING_REJECTED
+        if not self._model_matches_expected_content(candidate):
+            self._model = None
+            return False, 0.0, _WAKE_BINDING_REJECTED
+        self._model = candidate
+        path: Path | None = None
+        try:
+            if self.temp_root is not None:
+                self.temp_root.mkdir(parents=True, exist_ok=True)
+            handle = tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                delete=False,
+                dir=self.temp_root,
+            )
+            path = Path(handle.name)
+            handle.close()
+            _write_wav(path, pcm16, sample_rate)
+            result = candidate.verify_wav(path, self.extractor)
+            if (
+                not self._model_matches_expected_content(candidate)
+                or not self._binding_is_current()
+            ):
+                return False, 0.0, _WAKE_BINDING_REJECTED
+            return bool(result.accepted), float(result.score), str(result.reason)
+        except Exception:
+            self._model = None
+            return False, 0.0, _WAKE_BINDING_REJECTED
+        finally:
+            if path is not None:
+                path.unlink(missing_ok=True)
+
+
+def load_active_wake_word_binding(controller: CompanionController) -> WakeWordModelBinding:
+    """Resolve the active wake artifact independently from speaker identity.
+
+    A well-formed registry with no wake keys permits the legacy text boundary.
+    Once any wake binding key exists, every field, model byte, extractor, and
+    finalized-dataset fingerprint must validate or standby activation is
+    rejected.
+    """
+
+    root = (controller.config.runtime.root / "voiceguard").resolve()
+    registry_path = root / "enrollment_registry.json"
+    try:
+        with registry_path.open("r", encoding="utf-8") as stream:
+            registry = json.load(stream)
+    except FileNotFoundError:
+        return WakeWordModelBinding(False, registry_path=registry_path)
+    except Exception:
+        return WakeWordModelBinding(True, registry_path=registry_path)
+    if not isinstance(registry, Mapping):
+        return WakeWordModelBinding(True, registry_path=registry_path)
+    if not any(key in registry for key in _WAKE_WORD_REGISTRY_KEYS):
+        return WakeWordModelBinding(False, registry_path=registry_path)
+
+    try:
+        model_value = registry.get("wake_word_model")
+        dataset_fingerprint = registry.get("wake_word_model_dataset_fingerprint")
+        content_fingerprint = registry.get("wake_word_model_content_fingerprint")
+        if (
+            not isinstance(model_value, str)
+            or not model_value.strip()
+            or not isinstance(dataset_fingerprint, str)
+            or len(dataset_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in dataset_fingerprint.casefold())
+            or not isinstance(content_fingerprint, str)
+            or len(content_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in content_fingerprint.casefold())
+        ):
+            return WakeWordModelBinding(True, registry_path=registry_path)
+        model_path = Path(model_value).expanduser().resolve()
+        models_root = (root / "models").resolve()
+        if (
+            (model_path != models_root and models_root not in model_path.parents)
+            or not model_path.is_file()
+        ):
+            return WakeWordModelBinding(True, registry_path=registry_path)
+
+        from asher.voiceguard.enrollment import EnrollmentManager
+        from asher.voiceguard.features import StatisticalFeatureExtractor
+        from asher.voiceguard.model import CalibratedVoiceGuardModel
+
+        extractor = StatisticalFeatureExtractor()
+        verifier = FileWakeWordVerifier(
+            model_path,
+            extractor=extractor,
+            temp_root=root / "tmp",
+            registry_path=registry_path,
+            expected_dataset_fingerprint=dataset_fingerprint,
+            expected_model_content_fingerprint=content_fingerprint,
+        )
+        model = CalibratedVoiceGuardModel.load(model_path)
+        if not verifier._model_matches_expected_content(model):
+            return WakeWordModelBinding(True, registry_path=registry_path)
+        dataset = EnrollmentManager(root).load_training_dataset()
+        if dataset.fingerprint != dataset_fingerprint:
+            return WakeWordModelBinding(True, registry_path=registry_path)
+        verifier._model = model
+        return WakeWordModelBinding(
+            True,
+            verifier=verifier,
+            registry_path=registry_path,
+            reason="Active trained wake-word artifact",
+        )
+    except Exception:
+        return WakeWordModelBinding(True, registry_path=registry_path)
 
 
 @dataclass(frozen=True)
@@ -234,6 +689,7 @@ class VoiceRuntime:
         cloud_transcriber: Any | None = None,
         vocabulary: DynamicVocabulary | None = None,
         wake_detector: Any | None = None,
+        wake_word_binding: WakeWordModelBinding | None = None,
         voiceguard: VoiceGuardVerifier | None = None,
         tts: Any | None = None,
         active_window_seconds: float = 30.0,
@@ -262,6 +718,7 @@ class VoiceRuntime:
             fallback_transcriber=cloud_transcriber,
         )
         self.wake_detector = wake_detector or TextWakeDetector()
+        self._wake_word_binding_override = wake_word_binding
         self.energy_gate = EnergyGate()
         self.voiceguard = voiceguard
         if active_window_seconds <= 0:
@@ -277,6 +734,34 @@ class VoiceRuntime:
         loop = getattr(controller, "loop", None)
         self.states = getattr(loop, "states", None) or StateStore()
         self._stop = CancellationToken()
+        self._microphone_level_lock = threading.Lock()
+        self._microphone_level = 0.0
+
+    @property
+    def microphone_level(self) -> float:
+        """Latest presentation-only live-microphone RMS scalar.
+
+        No PCM is retained or published. TTS does not drive this value, so
+        synthetic speech has no fabricated amplitude animation.
+        """
+
+        with self._microphone_level_lock:
+            return self._microphone_level
+
+    def _observe_microphone_frame(self, pcm16: bytes, *, speech_detected: bool) -> None:
+        level = normalized_pcm16_rms(pcm16)
+        with self._microphone_level_lock:
+            if speech_detected:
+                self._microphone_level = level
+                return
+            # Frames below the standby gate are presentation silence. Decay
+            # quickly to an exact zero instead of preserving a noise floor.
+            decayed = self._microphone_level * 0.45
+            self._microphone_level = 0.0 if decayed < 0.005 else decayed
+
+    def _reset_microphone_level(self) -> None:
+        with self._microphone_level_lock:
+            self._microphone_level = 0.0
 
     def stop(self) -> None:
         """Stop microphone and speech work without latching emergency stop.
@@ -287,6 +772,7 @@ class VoiceRuntime:
         """
 
         self._stop.cancel("Voice runtime stopped")
+        self._reset_microphone_level()
         try:
             self.tts.stop()
         except Exception:
@@ -355,8 +841,32 @@ class VoiceRuntime:
                     if not wake.detected:
                         self._transition(AssistantState.STANDBY, "Wake phrase not detected")
                         continue
+                    binding = (
+                        self._wake_word_binding_override
+                        if self._wake_word_binding_override is not None
+                        else load_active_wake_word_binding(self.controller)
+                    )
+                    wake_accepted, wake_score, _wake_reason = binding.verify(
+                        turn.pcm16,
+                        turn.sample_rate,
+                    )
+                    if not wake_accepted:
+                        message = "Wake phrase was not verified by the active wake-word model"
+                        self._transition(AssistantState.STANDBY, message)
+                        self._emit(
+                            "wake_rejected",
+                            message,
+                            result.transcript,
+                            confidence=wake_score,
+                        )
+                        continue
                     self._transition(AssistantState.WAKE_DETECTED, "Hey Asher detected")
-                    self._emit("wake_detected", "Hey Asher detected", result.transcript)
+                    self._emit(
+                        "wake_detected",
+                        "Hey Asher detected",
+                        result.transcript,
+                        confidence=wake_score,
+                    )
                     self._transition(AssistantState.AUTHENTICATING, "Verifying speaker")
                     self._emit("authenticating", "Verifying speaker", result.transcript)
                     owner_id = None
@@ -414,18 +924,26 @@ class VoiceRuntime:
                     self._emit("confirmation", "Open the desktop confirmation panel to approve this action.", result.transcript, reply=reply)
         except (KeyboardInterrupt, CancelledError):
             self.stop()
+        finally:
+            self._reset_microphone_level()
 
     def _capture_trigger(self, frames: Any, *, deadline: float | None = None):
         # Skip silence cheaply, then let VAD collect a complete turn.
         while not self._stop.cancelled:
             if deadline is not None and self._clock() >= deadline:
+                self._reset_microphone_level()
                 return None
             try:
                 frame = next(frames)
             except StopIteration:
                 self.stop()
                 return None
-            if not self.energy_gate.detect(frame.pcm16).detected:
+            speech_detected = self.energy_gate.detect(frame.pcm16).detected
+            self._observe_microphone_frame(
+                frame.pcm16,
+                speech_detected=speech_detected,
+            )
+            if not speech_detected:
                 continue
             # A detected user turn is a barge-in signal. Providers are
             # interruptible; stopping here keeps speech from blocking the next
@@ -444,11 +962,23 @@ class VoiceRuntime:
                     if deadline is not None and self._clock() >= deadline:
                         return
                     try:
-                        yield next(frames)
+                        next_frame = next(frames)
                     except StopIteration:
                         return
+                    next_frame_detected = self.energy_gate.detect(
+                        next_frame.pcm16
+                    ).detected
+                    self._observe_microphone_frame(
+                        next_frame.pcm16,
+                        speech_detected=next_frame_detected,
+                    )
+                    yield next_frame
 
-            return capture.capture(remaining_frames(), cancellation=self._stop)
+            try:
+                return capture.capture(remaining_frames(), cancellation=self._stop)
+            finally:
+                self._reset_microphone_level()
+        self._reset_microphone_level()
         raise CancelledError(self._stop.reason)
 
     def _speak(

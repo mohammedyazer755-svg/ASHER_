@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import array
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from asher.voice.wakeword import (
     TextWakeDetector,
     match_wake_phrase,
 )
-from asher.voice.runtime import VoiceRuntime
+from asher.voice.runtime import VoiceRuntime, normalized_pcm16_rms
 from asher.voice.types import TranscriptResult
 
 
@@ -33,6 +34,101 @@ def pcm(amplitude: float, samples: int = 320) -> bytes:
 
 
 class WakeCaptureTests(unittest.TestCase):
+    def test_pcm16_rms_is_normalized_bounded_and_tolerates_partial_samples(self) -> None:
+        self.assertEqual(normalized_pcm16_rms(pcm(0.0)), 0.0)
+        self.assertAlmostEqual(normalized_pcm16_rms(pcm(0.5)), 0.5, places=3)
+        self.assertLessEqual(normalized_pcm16_rms(pcm(-1.0)), 1.0)
+        self.assertGreater(normalized_pcm16_rms(pcm(-1.0)), 0.99)
+        self.assertEqual(normalized_pcm16_rms(b"\x00"), 0.0)
+
+    def test_runtime_level_comes_from_frames_without_callback_or_pcm_publication(self) -> None:
+        class BlockingFrames:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.capture_waiting = threading.Event()
+                self.release = threading.Event()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return AudioFrame(pcm(0.5))
+                self.capture_waiting.set()
+                self.release.wait(1.0)
+                raise StopIteration
+
+        class QuietTTS:
+            @staticmethod
+            def stop() -> int:
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = SimpleNamespace(config=AsherConfig.load(directory))
+            events = []
+            runtime = VoiceRuntime(
+                controller,
+                transcriber=object(),
+                tts=QuietTTS(),
+                on_event=events.append,
+            )
+            frames = BlockingFrames()
+            worker = threading.Thread(target=runtime._capture_trigger, args=(frames,))
+            worker.start()
+            try:
+                self.assertTrue(frames.capture_waiting.wait(1.0))
+                self.assertAlmostEqual(runtime.microphone_level, 0.5, places=3)
+                self.assertEqual(events, [])
+                self.assertFalse(hasattr(runtime, "pcm16"))
+            finally:
+                frames.release.set()
+                worker.join(1.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(runtime.microphone_level, 0.0)
+
+    def test_runtime_level_decays_on_silence_and_resets_on_stop_and_error(self) -> None:
+        class QuietTTS:
+            @staticmethod
+            def stop() -> int:
+                return 0
+
+        class FailingBackend:
+            @staticmethod
+            def frames(_cancellation=None):
+                raise RuntimeError("fixture microphone failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = SimpleNamespace(config=AsherConfig.load(directory))
+            runtime = VoiceRuntime(
+                controller,
+                backend=FailingBackend(),
+                transcriber=object(),
+                tts=QuietTTS(),
+            )
+            runtime._observe_microphone_frame(pcm(0.8), speech_detected=True)
+            previous = runtime.microphone_level
+            runtime._observe_microphone_frame(pcm(0.0), speech_detected=False)
+            self.assertLess(runtime.microphone_level, previous)
+            for _ in range(8):
+                runtime._observe_microphone_frame(pcm(0.0), speech_detected=False)
+            self.assertEqual(runtime.microphone_level, 0.0)
+
+            runtime._observe_microphone_frame(pcm(0.4), speech_detected=True)
+            runtime.stop()
+            self.assertEqual(runtime.microphone_level, 0.0)
+
+            error_runtime = VoiceRuntime(
+                controller,
+                backend=FailingBackend(),
+                transcriber=object(),
+                tts=QuietTTS(),
+            )
+            error_runtime._observe_microphone_frame(pcm(0.4), speech_detected=True)
+            with self.assertRaisesRegex(RuntimeError, "fixture microphone failure"):
+                error_runtime.run_forever()
+            self.assertEqual(error_runtime.microphone_level, 0.0)
+
     def test_wake_matching_uses_word_boundaries(self) -> None:
         self.assertFalse(match_wake_phrase("washer").detected)
         match = match_wake_phrase("Noise, Hey Asher: search the contact")

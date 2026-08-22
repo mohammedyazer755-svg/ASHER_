@@ -6,6 +6,8 @@ import importlib
 import json
 import os
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Mapping
 from uuid import uuid4
@@ -23,6 +25,50 @@ from .schema import (
 
 
 MANIFEST_FILENAME = "manifest.json"
+SESSION_LOCK_FILENAME = ".recording-session.lock"
+_SESSION_LOCKS_GUARD = threading.Lock()
+_SESSION_LOCKS: dict[Path, threading.RLock] = {}
+_SESSION_TRANSACTION_STATE = threading.local()
+
+
+def _shared_session_lock(directory: Path) -> threading.RLock:
+    with _SESSION_LOCKS_GUARD:
+        return _SESSION_LOCKS.setdefault(directory, threading.RLock())
+
+
+@contextmanager
+def _session_filesystem_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        if stream.seek(0, os.SEEK_END) == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {11, 13} and getattr(exc, "winerror", None) not in {33, 36}:
+                        raise
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
@@ -62,6 +108,7 @@ class RecordingSession:
         self.manifest_path = self.directory / MANIFEST_FILENAME
         self._manifest = manifest
         self._lock = threading.RLock()
+        self._shared_lock = _shared_session_lock(self.directory)
 
     @property
     def manifest(self) -> SessionManifest:
@@ -113,6 +160,39 @@ class RecordingSession:
     def _persist(self) -> None:
         _atomic_json(self.manifest_path, self._manifest.to_dict())
 
+    def _refresh(self) -> SessionManifest:
+        """Refresh mutable state so a stale facade cannot undo disk changes."""
+
+        current = load_manifest(self.manifest_path)
+        if current.session_id != self.directory.name:
+            raise ManifestError("session directory and manifest identifier do not match")
+        self._manifest = current
+        return current
+
+    @contextmanager
+    def _mutation_transaction(self):
+        """Serialize manifest mutations across facades, threads, and processes."""
+
+        with self._shared_lock:
+            depths = getattr(_SESSION_TRANSACTION_STATE, "depths", None)
+            if depths is None:
+                depths = {}
+                _SESSION_TRANSACTION_STATE.depths = depths
+            depth = int(depths.get(self.directory, 0))
+            if depth:
+                depths[self.directory] = depth + 1
+                try:
+                    yield
+                finally:
+                    depths[self.directory] -= 1
+                return
+            with _session_filesystem_lock(self.directory / SESSION_LOCK_FILENAME):
+                depths[self.directory] = 1
+                try:
+                    yield
+                finally:
+                    depths.pop(self.directory, None)
+
     def add_audio(
         self,
         audio: PcmAudio,
@@ -126,9 +206,12 @@ class RecordingSession:
     ) -> SampleRecord:
         """Persist PCM audio and add its measured metadata to the session manifest."""
 
-        with self._lock:
-            if self._manifest.revoked:
+        with self._lock, self._mutation_transaction():
+            current = self._refresh()
+            if current.revoked:
                 raise ManifestError("cannot add audio to a revoked recording session")
+            if current.finalized:
+                raise ManifestError("cannot add audio to a finalized recording session")
             identifier = sample_id or uuid4().hex
             relative_path = f"clips/{identifier}.wav"
             destination = self.directory / Path(relative_path)
@@ -272,7 +355,10 @@ class RecordingSession:
     def remove_sample(self, sample_id: str) -> bool:
         """Remove one manifest-owned clip; returns False when it was not present."""
 
-        with self._lock:
+        with self._lock, self._mutation_transaction():
+            self._refresh()
+            if self._manifest.finalized:
+                raise ManifestError("cannot remove audio from a finalized recording session")
             match = next((item for item in self._manifest.samples if item.sample_id == sample_id), None)
             if match is None:
                 return False
@@ -287,11 +373,40 @@ class RecordingSession:
             source.unlink(missing_ok=True)
             return True
 
-    def revoke(self) -> SessionManifest:
-        """Mark a session unusable for all future dataset loads and retraining."""
-
-        with self._lock:
+    def _revoke(self, *, allow_finalized: bool) -> SessionManifest:
+        with self._lock, self._mutation_transaction():
+            self._refresh()
+            if self._manifest.finalized and not allow_finalized:
+                raise ManifestError(
+                    "finalized recording sessions must be revoked through EnrollmentManager"
+                )
             if not self._manifest.revoked:
                 self._manifest = self._manifest.revoke()
                 self._persist()
+            return self._manifest
+
+    def revoke(self) -> SessionManifest:
+        """Reject lifecycle-bypassing revocation.
+
+        Even an unregistered partial must be revoked through EnrollmentManager
+        so the shared lifecycle generation invalidates consent held by peer
+        desktop instances and processes.
+        """
+
+        raise ManifestError(
+            "recording sessions must be revoked through EnrollmentManager"
+        )
+
+    def _revoke_finalized(self) -> SessionManifest:
+        """Manager-only finalized revocation under the lifecycle lock."""
+
+        return self._revoke(allow_finalized=True)
+
+    def finalize(self) -> SessionManifest:
+        """Persist an immutable completion seal; idempotent for safe retries."""
+
+        with self._lock, self._mutation_transaction():
+            self._refresh()
+            self._manifest = self._manifest.finalize()
+            self._persist()
             return self._manifest

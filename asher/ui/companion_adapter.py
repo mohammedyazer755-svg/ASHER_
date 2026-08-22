@@ -11,11 +11,13 @@ different actor or session.
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import threading
 from dataclasses import replace
 from datetime import datetime
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -61,6 +63,7 @@ class CompanionDesktopController:
     ) -> None:
         self.companion = companion
         self._lock = threading.RLock()
+        self._reauth_lock = threading.Lock()
         self._owner_session = companion.create_owner_session(AuthMethod.LOCAL_UI)
         self._tts = tts or build_default_tts(selected_profile=companion.config.voice_profile)
         self._strong_auth = strong_authenticator or companion.strong_authenticator or DenyStrongAuthenticator()
@@ -77,6 +80,7 @@ class CompanionDesktopController:
         self._voice_runtime_factory = voice_runtime_factory
         self._voice_runtime: Any | None = None
         self._voice_thread: threading.Thread | None = None
+        self._closed = False
         self._memory = MemoryStore(companion.database)
         self._listening = False
         self._message = "Ready for Hey Asher"
@@ -90,7 +94,11 @@ class CompanionDesktopController:
             speech_style=self._tts.selected_profile.style,
             offline_only=not companion.config.openai_enabled,
             api_enabled=companion.config.openai_enabled,
-            microphone_index=None,
+            microphone_index=(
+                companion.config.microphone_index
+                if isinstance(companion.config.microphone_index, int)
+                else None
+            ),
         )
         self._unsubscribe_state = companion.loop.states.subscribe(self._on_state_event)
 
@@ -120,6 +128,27 @@ class CompanionDesktopController:
     def status(self) -> DesktopStatus:
         with self._lock:
             state = self._state()
+            runtime = self._voice_runtime
+            microphone_active = self._listening
+            microphone_level = 0.0
+            if microphone_active and runtime is not None:
+                try:
+                    microphone_level = float(
+                        getattr(runtime, "microphone_level", 0.0)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    microphone_level = 0.0
+                if not math.isfinite(microphone_level):
+                    microphone_level = 0.0
+                microphone_level = max(0.0, min(1.0, microphone_level))
+            active_owner_session = self.companion.sessions.get(
+                self._owner_session.session_id
+            )
+            owner_session_active = bool(
+                active_owner_session is not None
+                and active_owner_session.actor.role is Role.OWNER
+                and active_owner_session.actor.user_id == self.companion.owner.user_id
+            )
             return DesktopStatus(
                 state=state,
                 message=self._message,
@@ -127,13 +156,17 @@ class CompanionDesktopController:
                 api_configured=self.companion.config.openai_enabled
                 and importlib.util.find_spec("openai") is not None,
                 emergency_stopped=self.companion.emergency_stopped,
-                microphone_active=self._listening,
+                microphone_active=microphone_active,
+                owner_session_active=owner_session_active,
+                microphone_level=microphone_level,
             )
 
     def toggle_listening(self) -> DesktopStatus:
         runtime_to_stop: Any | None = None
         thread_to_join: threading.Thread | None = None
         with self._lock:
+            if self._closed:
+                raise RuntimeError("The desktop voice controller is closed")
             if self.companion.emergency_stopped:
                 raise RuntimeError("Reset the emergency stop before listening")
             starting = not self._listening
@@ -172,9 +205,13 @@ class CompanionDesktopController:
                 session_id=self._owner_session.session_id,
                 outcome="started" if starting else "stopped",
             )
-        if starting:
-            thread.start()
-        elif runtime_to_stop is not None:
+            if starting:
+                # Publish and start the runtime under the same lock used by
+                # emergency_stop(). This closes the window where an emergency
+                # stop could observe no runtime, latch the stop, and then have
+                # this worker start an orphan microphone thread afterwards.
+                thread.start()
+        if not starting and runtime_to_stop is not None:
             runtime_to_stop.stop()
             if thread_to_join is not None and thread_to_join is not threading.current_thread():
                 thread_to_join.join(timeout=2.0)
@@ -194,7 +231,12 @@ class CompanionDesktopController:
             load_active_voiceguard_verifier,
         )
 
+        # A concrete UI selection takes precedence. Otherwise use the
+        # environment-backed application default, which may be either a
+        # sounddevice index or an exact device name.
         device = self._settings.microphone_index
+        if device is None:
+            device = self.companion.config.microphone_index
         return VoiceRuntime(
             self.companion,
             backend=SoundDeviceBackend(device=device),
@@ -207,22 +249,26 @@ class CompanionDesktopController:
         try:
             runtime.run_forever()
         except Exception as error:
+            owned_runtime = False
             with self._lock:
-                self._listening = False
-                self._message = f"Voice input unavailable: {type(error).__name__}"
-                self._voice_runtime = None
-                self._voice_thread = None
-                self.companion.loop.states.transition(
-                    AssistantState.ERROR,
-                    self._message,
-                    error=type(error).__name__,
+                if self._voice_runtime is runtime:
+                    owned_runtime = True
+                    self._listening = False
+                    self._message = f"Voice input unavailable: {type(error).__name__}"
+                    self._voice_runtime = None
+                    self._voice_thread = None
+                    self.companion.loop.states.transition(
+                        AssistantState.ERROR,
+                        self._message,
+                        error=type(error).__name__,
+                    )
+            if owned_runtime:
+                self.companion.audit.append(
+                    "ui_voice_error",
+                    actor_id=self._owner_session.actor.user_id,
+                    session_id=self._owner_session.session_id,
+                    outcome=type(error).__name__,
                 )
-            self.companion.audit.append(
-                "ui_voice_error",
-                actor_id=self._owner_session.actor.user_id,
-                session_id=self._owner_session.session_id,
-                outcome=type(error).__name__,
-            )
         finally:
             with self._lock:
                 if self._voice_runtime is runtime:
@@ -264,6 +310,158 @@ class CompanionDesktopController:
                 "The desktop session expired. Re-authenticate locally before continuing."
             )
         return active
+
+    def _audit_reauthentication(
+        self,
+        outcome: str,
+        *,
+        session_id: str,
+        reason: str | None = None,
+    ) -> None:
+        details = {"method": AuthMethod.DEVICE_CREDENTIAL.value}
+        if reason:
+            details["reason"] = reason
+        self.companion.audit.append(
+            "ui_owner_reauthentication",
+            actor_id=self.companion.owner.user_id,
+            session_id=session_id,
+            outcome=outcome,
+            details=details,
+        )
+
+    def _lock_expired_owner_session(self, message: str, *, reason: str) -> None:
+        with self._lock:
+            self._message = message
+        self.companion.loop.states.transition(
+            AssistantState.LOCKED,
+            message,
+            reason=reason,
+            actor_id=self.companion.owner.user_id,
+        )
+
+    def reauthenticate_owner(self) -> DesktopStatus:
+        """Create a new owner session only after fresh strong device proof."""
+
+        with self._reauth_lock:
+            expected_owner_id = self.companion.owner.user_id
+            old_session = self._owner_session
+            old_session_id = old_session.session_id
+            owner = self.companion.users.get(expected_owner_id)
+            if (
+                owner is None
+                or owner.role is not Role.OWNER
+                or owner.user_id != expected_owner_id
+            ):
+                message = "The persistent owner identity is unavailable; session remains locked"
+                self._lock_expired_owner_session(
+                    message,
+                    reason="persistent_owner_unavailable",
+                )
+                self._audit_reauthentication(
+                    "denied",
+                    session_id=old_session_id,
+                    reason="persistent_owner_unavailable",
+                )
+                raise PermissionError(message)
+
+            if self.companion.sessions.get(old_session_id) is not None:
+                with self._lock:
+                    self._message = "Owner session is already active"
+                self._audit_reauthentication(
+                    "denied",
+                    session_id=old_session_id,
+                    reason="session_still_active",
+                )
+                raise RuntimeError(
+                    "The owner session is still active; re-authentication is not required"
+                )
+
+            try:
+                authentication = self._strong_auth.verify(
+                    "Re-authenticate the ASHER owner session"
+                )
+            except Exception as error:
+                message = "Device authentication could not be completed; session remains locked"
+                self._lock_expired_owner_session(message, reason="device_auth_error")
+                self._audit_reauthentication(
+                    "failed",
+                    session_id=old_session_id,
+                    reason="device_auth_error",
+                )
+                raise PermissionError(message) from error
+            if not authentication.verified:
+                message = "Device authentication was not verified; session remains locked"
+                self._lock_expired_owner_session(message, reason="device_auth_denied")
+                self._audit_reauthentication(
+                    "denied",
+                    session_id=old_session_id,
+                    reason="device_auth_denied",
+                )
+                raise PermissionError(message)
+
+            # Re-read after the device prompt so a changed/revoked identity is
+            # never authenticated using stale actor data.
+            verified_owner = self.companion.users.get(expected_owner_id)
+            if (
+                verified_owner is None
+                or verified_owner.role is not Role.OWNER
+                or verified_owner.user_id != owner.user_id
+            ):
+                message = "The persistent owner identity changed; session remains locked"
+                self._lock_expired_owner_session(
+                    message,
+                    reason="persistent_owner_changed",
+                )
+                self._audit_reauthentication(
+                    "denied",
+                    session_id=old_session_id,
+                    reason="persistent_owner_changed",
+                )
+                raise PermissionError(message)
+
+            # A confirmation is deliberately bound to the session that
+            # created it and must never be rebound to the fresh session. Once
+            # strong device proof succeeds, cancel an old-session checkpoint
+            # so it cannot become an invisible, permanently busy agent plan.
+            active = self.companion.loop.active
+            if (
+                active is not None
+                and active.waiting_confirmation_id
+                and active.session.session_id == old_session_id
+                and active.session.actor.user_id == expected_owner_id
+            ):
+                self.companion.loop.reject(
+                    active.waiting_confirmation_id,
+                    old_session,
+                )
+                # The confirmation can expire between inspection and reject.
+                # In that case the exact same plan remains paused; cancel it
+                # rather than leaving the agent permanently busy.
+                if self.companion.loop.active is active:
+                    self.companion.loop.cancel(
+                        "Expired owner-session confirmation cancelled during re-authentication"
+                    )
+
+            fresh_session = self.companion.sessions.create(
+                verified_owner,
+                AuthMethod.DEVICE_CREDENTIAL,
+            )
+            self.companion.sessions.invalidate(old_session_id)
+            with self._lock:
+                self._owner_session = fresh_session
+                self._manual_pending = None
+                self._message = "Owner session re-authenticated with device credentials"
+            self.companion.loop.states.transition(
+                AssistantState.AUTHENTICATED,
+                "Owner session re-authenticated",
+                actor_id=verified_owner.user_id,
+                auth_method=AuthMethod.DEVICE_CREDENTIAL.value,
+            )
+            self._audit_reauthentication(
+                "complete",
+                session_id=fresh_session.session_id,
+            )
+            return self.status()
 
     def submit_text(self, text: str) -> ConversationTurn:
         clean = str(text).strip()
@@ -449,7 +647,10 @@ class CompanionDesktopController:
         reply = self.companion.reject(pending.confirmation_id, session)
         with self._lock:
             self._message = redact_text(reply.text)
-        return any(item.status in {"failed", "denied", "cancelled"} for item in reply.updates)
+        # ``denied`` means the cancellation request itself was refused and the
+        # action is still pending. Report True only when the underlying plan
+        # was actually rejected/cancelled.
+        return any(item.status in {"failed", "cancelled"} for item in reply.updates)
 
     # ----------------------------------------------------------------- memory
     @property
@@ -586,6 +787,89 @@ class CompanionDesktopController:
             )
         return deleted
 
+    def _audit_memory_export(
+        self,
+        session: Any,
+        outcome: str,
+        *,
+        record_count: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Audit export metadata without retaining values or destination data."""
+
+        details: dict[str, Any] = {"format": "json"}
+        if record_count is not None:
+            details["record_count"] = int(record_count)
+        if reason:
+            details["reason"] = reason
+        self.companion.audit.append(
+            "ui_memory_export",
+            actor_id=session.actor.user_id,
+            session_id=session.session_id,
+            outcome=outcome,
+            details=details,
+        )
+
+    def export_memories(self, destination: str | Path) -> Path:
+        """Export owner memories atomically after fresh device authentication."""
+
+        session = self._active_owner_session()
+        if (
+            session.actor.role is not Role.OWNER
+            or session.actor.user_id != self.companion.owner.user_id
+        ):
+            self._audit_memory_export(session, "denied", reason="owner_required")
+            raise PermissionError("Only the owner can export private memory")
+
+        destination_text = str(destination).strip()
+        selected_path = Path(destination_text).expanduser() if destination_text else None
+        if (
+            selected_path is None
+            or not selected_path.is_absolute()
+            or selected_path.suffix.casefold() != ".json"
+        ):
+            self._audit_memory_export(session, "denied", reason="invalid_json_destination")
+            raise ValueError("Select an absolute JSON destination path")
+
+        try:
+            self._require_strong_auth(
+                "export private memories",
+                "the selected local JSON file",
+            )
+        except Exception as error:
+            self._audit_memory_export(
+                session,
+                "denied" if isinstance(error, PermissionError) else "failed",
+                reason="device_auth_denied" if isinstance(error, PermissionError) else "device_auth_error",
+            )
+            raise
+
+        records = self._memory_store.list(
+            session.actor,
+            owner_id=self.companion.owner.user_id,
+            include_sensitive=True,
+            limit=1000,
+        )
+        try:
+            exported = self._memory_store.export_json(
+                session.actor,
+                owner_id=self.companion.owner.user_id,
+                destination=selected_path,
+            )
+        except Exception:
+            self._audit_memory_export(
+                session,
+                "failed",
+                record_count=len(records),
+                reason="write_failed",
+            )
+            raise
+
+        self._audit_memory_export(session, "complete", record_count=len(records))
+        with self._lock:
+            self._message = f"Exported {len(records)} memories to the selected JSON file"
+        return exported
+
     # --------------------------------------------------------------- users/auth
     def _user_record(self, actor: Any) -> UserRecord:
         status, samples = self._enrollment.get(actor.user_id, ("not_enrolled", 0))
@@ -627,8 +911,10 @@ class CompanionDesktopController:
         begin_user = getattr(self._voiceguard, "begin_user", None)
         if not callable(begin_user):
             raise ControllerUnavailable("VoiceGuard recording service is not connected")
-        begin_user(user_id, actor.role.value, consent=True)
+        recovered = begin_user(user_id, actor.role.value, consent=True)
         samples = self._enrollment.get(user_id, ("collecting_samples", 0))[1]
+        if isinstance(recovered, int) and not isinstance(recovered, bool):
+            samples = max(0, recovered)
         self._enrollment[user_id] = ("collecting_samples", samples)
         return self._user_record(actor)
 
@@ -834,12 +1120,14 @@ class CompanionDesktopController:
 
     # --------------------------------------------------------------- stop/reset
     def emergency_stop(self) -> DesktopStatus:
-        runtime = self._voice_runtime
-        if runtime is not None:
-            runtime.stop()
-        self._tts.stop()
-        self.companion.emergency_stop()
+        runtime: Any | None
+        thread: threading.Thread | None
+        # Serialize the latch/snapshot with toggle_listening(). Once this lock
+        # is released, no new runtime can pass its emergency-stop check.
         with self._lock:
+            self.companion.emergency_stop()
+            runtime = self._voice_runtime
+            thread = self._voice_thread
             self._listening = False
             self._voice_runtime = None
             self._voice_thread = None
@@ -851,16 +1139,25 @@ class CompanionDesktopController:
                 else item
                 for item in self._steps
             ]
+        if runtime is not None:
+            runtime.stop()
+        self._tts.stop()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         return self.status()
 
     def close(self) -> None:
         """Stop background voice/TTS work when the desktop window closes."""
 
-        runtime = self._voice_runtime
-        thread = self._voice_thread
-        self._voice_runtime = None
-        self._voice_thread = None
-        self._listening = False
+        # Share the lifecycle lock with toggle_listening() so a closing window
+        # cannot lose a runtime that is concurrently being constructed.
+        with self._lock:
+            self._closed = True
+            runtime = self._voice_runtime
+            thread = self._voice_thread
+            self._voice_runtime = None
+            self._voice_thread = None
+            self._listening = False
         if runtime is not None:
             runtime.stop()
         if thread is not None and thread is not threading.current_thread():

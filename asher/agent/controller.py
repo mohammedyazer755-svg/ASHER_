@@ -173,6 +173,26 @@ class CompanionController:
             actor_id=session.actor.user_id,
         )
         plan = self.planner.plan(text, context=context)
+        if (
+            not self.memory_store.enabled
+            and any(step.call.tool_name.startswith("memory.") for step in plan.steps)
+        ):
+            self.audit.append(
+                "memory_policy",
+                actor_id=session.actor.user_id,
+                session_id=session.session_id,
+                outcome="disabled",
+            )
+            self.loop.states.transition(
+                AssistantState.ERROR,
+                "Long-term memory is disabled",
+                reason="memory_disabled",
+            )
+            return CompanionReply(
+                "Long-term memory is disabled in local privacy settings.",
+                offline=True,
+                provider="local-policy",
+            )
         emotional = infer_emotional_context(text)
         if emotional is not None and not plan.steps and plan.response:
             response = {
@@ -225,6 +245,22 @@ class CompanionController:
                 text_reply = "I do not have a non-sensitive memory matching that yet."
         self.working_memory.append(session.session_id, "assistant", redact_text(text_reply))
         return CompanionReply(text_reply, updates, offline=plan.offline, provider=plan.provider, confirmation_id=confirmation_id)
+
+    @property
+    def memory_enabled(self) -> bool:
+        return self.memory_store.enabled
+
+    @property
+    def memory_retention_days(self) -> int:
+        return self.memory_store.retention_days
+
+    def configure_memory(self, *, enabled: bool, retention_days: int) -> None:
+        """Persist the local long-term-memory policy shared by every tool."""
+
+        self.memory_store.configure(
+            enabled=enabled,
+            retention_days=retention_days,
+        )
 
     def approve(self, confirmation_id: str, session: SessionContext, *, device_authenticated: bool = False) -> CompanionReply:
         active_session = self._resolve_session(session)

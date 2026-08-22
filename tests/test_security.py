@@ -14,7 +14,7 @@ from asher.security.policy import DecisionKind, PolicyEngine, ToolPolicy
 from asher.security.sessions import SessionManager
 from asher.security.users import UserStore, guest_actor
 from asher.storage import Database
-from asher.types import AuthMethod, RiskLevel, Role, utc_now
+from asher.types import Actor, AuthMethod, RiskLevel, Role, utc_now
 
 
 class SecurityTests(unittest.TestCase):
@@ -178,6 +178,55 @@ class SecurityTests(unittest.TestCase):
             self.assertEqual(updated.memory_id, record.memory_id)
             self.assertTrue(store.delete(owner, record.memory_id, confirmed=True))
             self.assertIsNone(store.get(owner, record.memory_id))
+
+    def test_memory_disable_and_retention_are_persistent_and_fail_closed(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from asher.memory.retrieval import MemoryRetriever
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "asher.db")
+            store = MemoryStore(database)
+            owner = Actor("owner", "Owner", Role.OWNER)
+            store.configure(enabled=True, retention_days=30)
+            before = datetime.now(UTC)
+            record = store.put(
+                owner,
+                owner_id=owner.user_id,
+                memory_type="semantic",
+                key="retained project",
+                value="voice evaluation",
+                source="test",
+                confirmed=True,
+            )
+            self.assertIsNotNone(record.expires_at)
+            self.assertGreaterEqual(record.expires_at, before + timedelta(days=29))
+            self.assertEqual(MemoryStore(database).retention_days, 30)
+
+            store.configure(enabled=False, retention_days=30)
+            self.assertFalse(MemoryStore(database).enabled)
+            self.assertEqual(
+                MemoryRetriever(store).retrieve(
+                    owner,
+                    owner_id=owner.user_id,
+                    query="project",
+                ),
+                [],
+            )
+            with self.assertRaises(PermissionError):
+                store.put(
+                    owner,
+                    owner_id=owner.user_id,
+                    memory_type="semantic",
+                    key="blocked",
+                    value="blocked",
+                    source="test",
+                    confirmed=True,
+                )
+            # Disabling capture/retrieval must not hold existing records
+            # hostage: the owner can still inspect, export, or delete them.
+            self.assertEqual(store.list(owner, owner_id=owner.user_id)[0].memory_id, record.memory_id)
+            self.assertTrue(store.delete(owner, record.memory_id, confirmed=True))
 
     def test_audit_redacts_payload_keys_and_emergency_stop_is_global(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

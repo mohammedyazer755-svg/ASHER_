@@ -52,6 +52,20 @@ def _enum_value(value: str | Enum, enum_type: type[Enum], field_name: str) -> st
         raise ManifestError(f"{field_name} must be one of: {allowed}") from exc
 
 
+def _json_bool(value: Any, field_name: str) -> bool:
+    """Accept JSON booleans only; strings such as ``"false"`` are invalid."""
+
+    if not isinstance(value, bool):
+        raise ManifestError(f"{field_name} must be a JSON boolean")
+    return value
+
+
+def _optional_json_bool(value: Any, field_name: str) -> bool | None:
+    if value is None:
+        return None
+    return _json_bool(value, field_name)
+
+
 def validate_relative_wav_path(value: str) -> str:
     """Validate and normalize a manifest-owned relative WAV path."""
 
@@ -131,13 +145,15 @@ class SampleRecord:
                 sample_rate=int(value["sample_rate"]),
                 channels=int(value["channels"]),
                 sample_width=int(value.get("sample_width", 2)),
-                contains_wake_phrase=bool(value.get("contains_wake_phrase", False)),
+                contains_wake_phrase=_json_bool(
+                    value.get("contains_wake_phrase", False),
+                    "contains_wake_phrase",
+                ),
                 condition=str(value.get("condition", SampleCondition.CLEAN.value)),
                 origin=str(value.get("origin", SampleOrigin.RECORDED.value)),
-                expected_authorized=(
-                    None
-                    if value.get("expected_authorized") is None
-                    else bool(value["expected_authorized"])
+                expected_authorized=_optional_json_bool(
+                    value.get("expected_authorized"),
+                    "expected_authorized",
                 ),
                 source_sample_id=(
                     None if value.get("source_sample_id") is None else str(value["source_sample_id"])
@@ -158,6 +174,7 @@ class SessionManifest:
     environment: str
     consent_given_at: str
     created_at: str = field(default_factory=utc_timestamp)
+    finalized_at: str | None = None
     revoked_at: str | None = None
     samples: tuple[SampleRecord, ...] = ()
     schema_version: int = SCHEMA_VERSION
@@ -180,16 +197,55 @@ class SessionManifest:
         paths = [sample.path.casefold() for sample in self.samples]
         if len(ids) != len(set(ids)) or len(paths) != len(set(paths)):
             raise ManifestError("sample identifiers and paths must be unique within a session")
+        by_id = {sample.sample_id: sample for sample in self.samples}
+        for sample in self.samples:
+            if sample.origin != SampleOrigin.AUGMENTED.value:
+                if sample.source_sample_id is not None:
+                    raise ManifestError(
+                        "only an augmented sample may reference a source recording"
+                    )
+                continue
+            source = by_id.get(sample.source_sample_id or "")
+            if source is None or source.origin == SampleOrigin.AUGMENTED.value:
+                raise ManifestError(
+                    "an augmented sample must reference a source recording in the same session"
+                )
+            if source.condition == SampleCondition.REPLAY.value:
+                raise ManifestError("replay trials cannot be used as augmentation sources")
+            if (
+                sample.contains_wake_phrase != source.contains_wake_phrase
+                or sample.expected_authorized != source.expected_authorized
+            ):
+                raise ManifestError(
+                    "an augmented sample must preserve its source wake and authorization labels"
+                )
 
     @property
     def revoked(self) -> bool:
         return self.revoked_at is not None
 
+    @property
+    def finalized(self) -> bool:
+        return self.finalized_at is not None
+
     def add_sample(self, sample: SampleRecord) -> "SessionManifest":
+        if self.finalized:
+            raise ManifestError("cannot add audio to a finalized recording session")
+        if self.revoked:
+            raise ManifestError("cannot add audio to a revoked recording session")
         return replace(self, samples=(*self.samples, sample))
 
     def without_sample(self, sample_id: str) -> "SessionManifest":
+        if self.finalized:
+            raise ManifestError("cannot remove audio from a finalized recording session")
         return replace(self, samples=tuple(s for s in self.samples if s.sample_id != sample_id))
+
+    def finalize(self, when: str | None = None) -> "SessionManifest":
+        if self.finalized:
+            return self
+        if self.revoked:
+            raise ManifestError("cannot finalize a revoked recording session")
+        return replace(self, finalized_at=when or utc_timestamp())
 
     def revoke(self, when: str | None = None) -> "SessionManifest":
         return replace(self, revoked_at=when or utc_timestamp())
@@ -203,6 +259,7 @@ class SessionManifest:
             "environment": self.environment,
             "consent_given_at": self.consent_given_at,
             "created_at": self.created_at,
+            "finalized_at": self.finalized_at,
             "revoked_at": self.revoked_at,
             "samples": [sample.to_dict() for sample in self.samples],
         }
@@ -221,6 +278,11 @@ class SessionManifest:
                 environment=str(value["environment"]),
                 consent_given_at=str(value["consent_given_at"]),
                 created_at=str(value.get("created_at", "")) or utc_timestamp(),
+                finalized_at=(
+                    None
+                    if value.get("finalized_at") is None
+                    else str(value["finalized_at"])
+                ),
                 revoked_at=None if value.get("revoked_at") is None else str(value["revoked_at"]),
                 samples=tuple(SampleRecord.from_dict(item) for item in raw_samples),
             )

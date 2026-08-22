@@ -32,6 +32,22 @@ def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
     return value
 
 
+def _microphone_index() -> int | str | None:
+    """Parse an optional sounddevice index or exact device name."""
+
+    raw = os.getenv("ASHER_MIC_INDEX")
+    if raw is None or not raw.strip():
+        return None
+    value = raw.strip()
+    try:
+        index = int(value)
+    except ValueError:
+        return value
+    if index < 0:
+        raise ValueError("ASHER_MIC_INDEX must be a non-negative index or device name")
+    return index
+
+
 def _ollama_endpoint() -> tuple[str, bool]:
     """Validate the Ollama endpoint and report whether it is loopback-only.
 
@@ -79,6 +95,7 @@ class AsherConfig:
     whisper_model: str = "small.en"
     whisper_device: str = "auto"
     whisper_compute_type: str = "auto"
+    microphone_index: int | str | None = None
 
     @property
     def openai_enabled(self) -> bool:
@@ -117,4 +134,5 @@ class AsherConfig:
             whisper_model=os.getenv("ASHER_WHISPER_MODEL", "small.en").strip(),
             whisper_device=device,
             whisper_compute_type=os.getenv("ASHER_WHISPER_COMPUTE_TYPE", "auto").strip(),
+            microphone_index=_microphone_index(),
         )

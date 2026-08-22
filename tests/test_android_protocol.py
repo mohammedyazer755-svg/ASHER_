@@ -8,7 +8,9 @@ wire-format drift before an Android toolchain is available.
 from __future__ import annotations
 
 import copy
+import re
 import unittest
+from pathlib import Path
 
 from android.pc_mock.protocol import (
     VERSION,
@@ -90,6 +92,59 @@ class AndroidProtocolTests(unittest.TestCase):
         tampered["ct"] = tampered["ct"][:-1] + ("A" if tampered["ct"][-1] != "A" else "B")
         with self.assertRaises(Exception):
             decrypt_frame(key, tampered)
+
+
+class AndroidSourceContractTests(unittest.TestCase):
+    """Catch build-boundary drift even when the Android SDK is unavailable."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.android_root = Path(__file__).resolve().parents[1] / "android" / "app" / "src" / "main"
+
+    def test_local_kotlin_imports_resolve_to_declared_top_level_types(self) -> None:
+        source_root = self.android_root / "java"
+        sources = tuple(source_root.rglob("*.kt"))
+        declared: set[str] = set()
+        local_imports: list[tuple[Path, str]] = []
+        declaration_pattern = re.compile(
+            r"^(?:data\s+|enum\s+|sealed\s+|open\s+|abstract\s+)?"
+            r"(?:class|interface|object)\s+([A-Za-z_][A-Za-z0-9_]*)",
+            re.MULTILINE,
+        )
+        for source in sources:
+            text = source.read_text(encoding="utf-8")
+            package_match = re.search(r"^package\s+([A-Za-z0-9_.]+)", text, re.MULTILINE)
+            self.assertIsNotNone(package_match, source)
+            package = package_match.group(1)
+            declared.update(
+                f"{package}.{name}" for name in declaration_pattern.findall(text)
+            )
+            local_imports.extend(
+                (source, imported)
+                for imported in re.findall(r"^import\s+(com\.asher\.companion\.[A-Za-z0-9_.]+)", text, re.MULTILINE)
+            )
+
+        unresolved = [
+            f"{source.relative_to(source_root)} -> {imported}"
+            for source, imported in local_imports
+            if imported not in declared
+            and imported not in {"com.asher.companion.R", "com.asher.companion.BuildConfig"}
+        ]
+        self.assertEqual(unresolved, [])
+
+    def test_declared_runtime_permissions_cover_phone_call_policy(self) -> None:
+        manifest = (self.android_root / "AndroidManifest.xml").read_text(encoding="utf-8")
+        policy = (
+            self.android_root
+            / "java"
+            / "com"
+            / "asher"
+            / "companion"
+            / "security"
+            / "RuntimePermissionGate.kt"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Manifest.permission.CALL_PHONE", policy)
+        self.assertIn('android.permission.CALL_PHONE', manifest)
 
 
 if __name__ == "__main__":

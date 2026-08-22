@@ -90,6 +90,27 @@ Optional Qt smoke tests are skipped when PySide6 is not installed. VoiceGuard
 metrics intentionally report unavailable conditions when real noisy/replay
 recordings are absent; no accuracy or authentication result is fabricated.
 
+Check the private VoiceGuard dataset without loading ML dependencies:
+
+```powershell
+.\.venv\Scripts\python.exe -B train_voiceguard.py --check
+```
+
+Training stays disabled until finalized, consented sessions can form
+session-separated train/validation/test partitions with authorized and real
+unauthorized identity coverage. Replay trials remain evaluation-only, and
+held-out reports distinguish identity errors from binary FAR/FRR. When ready,
+run the same command without `--check`;
+the versioned model and validation/test reports remain under ASHER's private
+runtime directory and are never overwritten in place. Same-environment sessions
+need a conservative metadata time gap; declared environment/timestamp evidence
+does not prove physical independence, and correlated extras are excluded from
+both readiness and actual held-out partitions. Consented partial desktop
+collections are surfaced and resumable after restart under shared disk locks,
+while revocation immediately invalidates active model bindings and cached
+verification falls closed against the bound model and finalized-dataset
+fingerprints. See `RUN_ASHER.md` for the collection sequence.
+
 ## Status
 
 The implementation and test evidence, including environment-only blockers

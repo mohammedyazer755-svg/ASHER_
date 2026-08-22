@@ -204,12 +204,14 @@ class EvaluationTests(unittest.TestCase):
                 intent=fixtures[0].expected_intent,
                 contact=fixtures[0].expected_contact,
                 latency_ms=10,
+                task_success=True,
             ),
             VoicePrediction(
                 fixture_id=fixtures[1].fixture_id,
                 transcript="wrong command",
                 intent="unknown",
                 latency_ms=30,
+                task_success=False,
             ),
         ]
         report = evaluate_predictions(fixtures, predictions)
@@ -217,6 +219,12 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(report.missing_prediction_count, 2)
         self.assertEqual(report.latency_sample_count, 2)
         self.assertIsNotNone(report.p95_latency_ms)
+        self.assertEqual(report.task_case_count, 4)
+        self.assertEqual(report.task_success_rate, 0.25)
+        self.assertEqual(
+            set(report.by_condition),
+            {"quiet-near", "quiet-far", "fan-noise-near", "fan-noise-far"},
+        )
 
     def test_fixture_manifest_round_trip(self) -> None:
         fixtures = generate_non_private_fixtures(5)

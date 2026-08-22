@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from asher.types import RiskLevel
 from asher.ui import is_available
@@ -115,6 +117,116 @@ class QtSmokeTests(unittest.TestCase):
         window.select_page("Memory")
         self.app.processEvents()
         self.assertEqual(window.stack.currentWidget(), window.memory_page)
+        window.close()
+
+    def test_memory_export_uses_workspace_save_dialog_and_stays_out_of_companion(self) -> None:
+        from PySide6.QtWidgets import QPushButton
+
+        from asher.ui.window import AsherMainWindow
+
+        controller = _controller()
+        window = AsherMainWindow(controller)
+        window.show()
+        window.select_page("Memory")
+        self.app.processEvents()
+
+        self.assertTrue(window.memory_page.export_button.isVisible())
+        self.assertNotIn(
+            "Export JSON",
+            [button.text() for button in window.companion_mode.findChildren(QPushButton)],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            selected = os.path.join(directory, "selected-memory-export")
+            with (
+                patch(
+                    "asher.ui.window.QFileDialog.getSaveFileName",
+                    return_value=(selected, "JSON files (*.json)"),
+                ),
+                patch.object(window, "_run") as run,
+            ):
+                window.memory_page.export_button.click()
+                self.app.processEvents()
+
+            run.assert_called_once()
+            args, kwargs = run.call_args
+            self.assertEqual(args[0], controller.export_memories)
+            self.assertEqual(args[1], selected + ".json")
+            self.assertEqual(kwargs["on_result"], window._memory_export_result)
+
+        window.close()
+
+    def test_reauthentication_control_and_expired_status_are_workspace_only(self) -> None:
+        from dataclasses import replace
+
+        from PySide6.QtWidgets import QPushButton
+
+        from asher.ui.window import AsherMainWindow
+
+        controller = _controller()
+        window = AsherMainWindow(controller)
+        window.show()
+        self.app.processEvents()
+
+        expired = replace(controller.status(), owner_session_active=False)
+        with patch.object(controller, "status", return_value=expired):
+            window._refresh_status()
+        self.assertEqual(window.header_session.text(), "SESSION EXPIRED")
+        self.assertTrue(window.reauthenticate_button.isVisible())
+        self.assertNotIn(
+            "Re-authenticate",
+            [button.text() for button in window.companion_mode.findChildren(QPushButton)],
+        )
+
+        with patch.object(window, "_run") as run:
+            window.reauthenticate_button.click()
+            self.app.processEvents()
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], controller.reauthenticate_owner)
+        self.assertEqual(kwargs["on_result"], window._reauthentication_result)
+        window.close()
+
+    def test_real_microphone_level_reaches_both_orbs_and_resets_without_tts_fabrication(self) -> None:
+        from dataclasses import replace
+
+        from asher.core.state import AssistantState
+        from asher.ui.window import AsherMainWindow
+
+        controller = _controller()
+        window = AsherMainWindow(controller)
+        window.show()
+        self.app.processEvents()
+
+        listening = replace(
+            controller.status(),
+            state=AssistantState.LISTENING,
+            microphone_active=True,
+            microphone_level=0.37,
+        )
+        with patch.object(controller, "status", return_value=listening):
+            window._refresh_status()
+        self.app.processEvents()
+        self.assertAlmostEqual(window.home.orb._audio_level, 0.37)
+        # The visible Companion orb may consume one presentation-decay tick
+        # while processEvents() paints it; the real sample must remain present
+        # and bounded, not equal an animation-frame-dependent exact value.
+        self.assertGreater(window.companion_mode.orb._audio_level, 0.0)
+        self.assertLessEqual(window.companion_mode.orb._audio_level, 0.37)
+        self.assertFalse(window.home.orb.isVisible())
+        self.assertFalse(window.home.orb._timer.isActive())
+
+        # A speaking state never manufactures amplitude: without active real
+        # microphone input, even a stale/non-zero scalar is forced to zero.
+        speaking = replace(
+            listening,
+            state=AssistantState.SPEAKING,
+            microphone_active=False,
+            microphone_level=0.91,
+        )
+        with patch.object(controller, "status", return_value=speaking):
+            window._refresh_status()
+        self.assertEqual(window.home.orb._audio_level, 0.0)
+        self.assertEqual(window.companion_mode.orb._audio_level, 0.0)
         window.close()
 
 

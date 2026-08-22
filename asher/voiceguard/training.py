@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import math
 import random
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .dataset import (
@@ -18,8 +20,9 @@ from .dataset import (
 from .exceptions import DatasetError, MLDependencyError, ModelError
 from .features import FeatureExtractor, StatisticalFeatureExtractor
 from .metrics import EvaluationObservation, EvaluationReport, evaluate_predictions
-from .model import CalibratedVoiceGuardModel, model_fingerprint
-from .schema import SampleCondition, TrainingTask
+from .model import CalibratedVoiceGuardModel, model_content_fingerprint
+from .readiness import independent_dataset_view
+from .schema import SampleCondition, SampleOrigin, TrainingTask
 
 
 @dataclass(frozen=True)
@@ -64,11 +67,21 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class TrainingArtifacts:
+    """Private, versioned files persisted for an activated training run."""
+
+    model_path: Path
+    validation_report_path: Path
+    test_report_path: Path
+
+
+@dataclass(frozen=True)
 class TrainingResult:
     model: CalibratedVoiceGuardModel
     split: DatasetSplit
     validation_report: EvaluationReport
     test_report: EvaluationReport
+    artifacts: TrainingArtifacts | None = None
 
     @property
     def measured_test(self) -> bool:
@@ -137,25 +150,13 @@ def feature_examples_from_dataset(
                 features=features,
                 expected_authorized=sample.expected_authorized_for(selected_task, labels),
                 condition=sample.record.condition,
+                origin=sample.record.origin,
+                source_sample_id=sample.record.source_sample_id,
             )
         )
     if not result:
         raise DatasetError("no non-revoked WAV samples are available for training")
     return tuple(result)
-
-
-def _score_from_probabilities(
-    probabilities: dict[str, float],
-    authorized_labels: Sequence[str],
-) -> tuple[float, str]:
-    authorized = {label: probabilities.get(label, 0.0) for label in authorized_labels}
-    if not authorized:
-        label = max(probabilities, key=probabilities.get)
-        return probabilities[label], label
-    label = max(authorized, key=authorized.get)
-    # For several authorized identities, total authorized mass is the
-    # authentication score while argmax chooses the displayed identity.
-    return sum(authorized.values()), label
 
 
 def _observations(
@@ -165,14 +166,20 @@ def _observations(
     output: list[EvaluationObservation] = []
     for item in examples:
         score, label, _ = model.score_and_label(item.features)
+        acceptance_eligible = label in model.authorized_labels
         output.append(
             EvaluationObservation(
                 sample_id=item.sample_id,
                 true_label=item.label,
                 score=score,
-                predicted_label=label if score >= model.threshold else "unknown",
+                predicted_label=(
+                    label
+                    if acceptance_eligible and score >= model.threshold
+                    else "unknown"
+                ),
                 expected_authorized=item.expected_authorized,
                 condition=item.condition,
+                acceptance_eligible=acceptance_eligible,
             )
         )
     return tuple(output)
@@ -220,15 +227,23 @@ class VoiceGuardTrainer:
 
     def train_dataset(self, dataset: VoiceDataset, config: TrainingConfig | None = None) -> TrainingResult:
         selected = config or TrainingConfig()
-        authorized_labels = selected.resolved_authorized_labels_for_dataset(dataset)
+        independent = independent_dataset_view(
+            dataset,
+            task=selected.task,
+        )
+        authorized_labels = selected.resolved_authorized_labels_for_dataset(independent)
         selected = replace(selected, authorized_labels=authorized_labels)
         examples = feature_examples_from_dataset(
-            dataset,
+            independent,
             self.extractor,
             task=selected.task,
             authorized_labels=authorized_labels,
         )
-        return self.train_examples(examples, selected, dataset_fingerprint=dataset.fingerprint)
+        return self.train_examples(
+            examples,
+            selected,
+            dataset_fingerprint=independent.fingerprint,
+        )
 
     def train_examples(
         self,
@@ -241,35 +256,90 @@ class VoiceGuardTrainer:
         task = TrainingTask(selected.task)
         authorized_labels = selected.resolved_authorized_labels()
         values = tuple(examples)
-        if len(values) < selected.minimum_training_samples:
+        source_values = tuple(item for item in values if not item.is_augmented)
+        fit_source_values = tuple(
+            item
+            for item in source_values
+            if item.condition != SampleCondition.REPLAY.value
+        )
+        if len(fit_source_values) < selected.minimum_training_samples:
             raise DatasetError(
-                f"at least {selected.minimum_training_samples} feature examples are required for training"
+                f"at least {selected.minimum_training_samples} non-replay source examples are required for training"
             )
         dimensions = len(values[0].features)
         if any(len(item.features) != dimensions for item in values):
             raise DatasetError("all feature vectors must have the same dimension")
-        split = session_separated_split(
-            values,
+        source_index = {
+            (item.session_id, item.sample_id): item
+            for item in source_values
+        }
+        if len(source_index) != len(source_values):
+            raise DatasetError("source feature sample identifiers must be unique within each session")
+        for item in values:
+            if not item.is_augmented:
+                continue
+            source = source_index.get((item.session_id, item.source_sample_id or ""))
+            if source is None:
+                raise DatasetError(
+                    "an augmented example must reference a source example in the same session"
+                )
+            if source.condition == SampleCondition.REPLAY.value:
+                raise DatasetError("replay trials cannot be used as augmentation sources")
+            if (
+                item.label != source.label
+                or item.expected_authorized != source.expected_authorized
+            ):
+                raise DatasetError(
+                    "an augmented example must preserve its source classifier and authorization labels"
+                )
+
+        source_labels = {item.label for item in fit_source_values}
+        if {item.label for item in values if item.condition != SampleCondition.REPLAY.value} - source_labels:
+            raise DatasetError("augmented examples cannot introduce a classifier class")
+        authorized_set = set(authorized_labels)
+        if not authorized_set.issubset(source_labels):
+            raise DatasetError("one or more configured authorized classes lack source recordings")
+        if task is TrainingTask.SPEAKER_AUTH and not (source_labels - authorized_set):
+            raise DatasetError(
+                "speaker authentication requires at least one non-replay unauthorized identity class"
+            )
+
+        source_split = session_separated_split(
+            source_values,
             validation_fraction=selected.validation_fraction,
             test_fraction=selected.test_fraction,
             seed=selected.seed,
         )
+        # Split only source recordings.  Derivatives follow their source
+        # session into training, but derivatives belonging to held-out
+        # sessions are excluded from calibration and evaluation.
+        split = DatasetSplit(
+            train=tuple(
+                item for item in values if item.session_id in source_split.train_sessions
+            ),
+            validation=source_split.validation,
+            test=source_split.test,
+        )
         split.assert_session_separated()
-        train_labels = {item.label for item in split.train}
-        all_labels = {item.label for item in values}
+        fit_train = tuple(
+            item
+            for item in split.train
+            if item.condition != SampleCondition.REPLAY.value
+        )
+        train_labels = {item.label for item in fit_train}
+        all_labels = source_labels
         missing = all_labels - train_labels
         if missing:
             raise DatasetError(
-                "training partition is missing classes " + ", ".join(sorted(missing)) + "; record each class in multiple sessions"
+                "the training partition is missing one or more classifier classes; "
+                "record every class in multiple independent sessions"
             )
         if len(train_labels) < 2:
             raise DatasetError("at least two classes are required for a verifier classifier")
-        if not set(authorized_labels).issubset(all_labels):
-            raise DatasetError("configured authorized labels are absent from the dataset")
 
         numpy, standard_scaler_type, logistic_type = _require_ml()
-        matrix = numpy.asarray([item.features for item in split.train], dtype=float)
-        target = numpy.asarray([item.label for item in split.train], dtype=str)
+        matrix = numpy.asarray([item.features for item in fit_train], dtype=float)
+        target = numpy.asarray([item.label for item in fit_train], dtype=str)
         scaler = standard_scaler_type()
         scaled = scaler.fit_transform(matrix)
         try:
@@ -287,6 +357,11 @@ class VoiceGuardTrainer:
         raw_intercepts = classifier.intercept_.tolist()
         coefficients = tuple(tuple(float(value) for value in row) for row in raw_coefficients)
         intercepts = tuple(float(value) for value in raw_intercepts)
+        binary_positive_class = (
+            classes[-1]
+            if len(classes) == 2 and len(coefficients) == 1
+            else None
+        )
         provisional_metadata = {
             "schema_version": 1,
             "task": task.value,
@@ -299,6 +374,9 @@ class VoiceGuardTrainer:
             },
             "dataset": {
                 "sample_count": len(values),
+                "source_sample_count": len(source_values),
+                "augmented_sample_count": len(values) - len(source_values),
+                "fit_eligible_source_sample_count": len(fit_source_values),
                 "session_count": len({item.session_id for item in values}),
                 "fingerprint": dataset_fingerprint,
             },
@@ -314,6 +392,7 @@ class VoiceGuardTrainer:
             authorized_labels=authorized_labels,
             extractor_metadata=self.extractor.metadata,
             metadata=provisional_metadata,
+            binary_positive_class=binary_positive_class,
         )
         threshold, calibration = _calibrate_threshold(provisional, split.validation)
         base_metadata = dict(provisional_metadata)
@@ -325,25 +404,24 @@ class VoiceGuardTrainer:
                     "train_session_count": len(split.train_sessions),
                     "validation_session_count": len(split.validation_sessions),
                     "test_session_count": len(split.test_sessions),
+                    "augmented_train_sample_count": sum(
+                        item.origin == SampleOrigin.AUGMENTED.value for item in fit_train
+                    ),
+                    "fit_train_sample_count": len(fit_train),
+                    "excluded_replay_train_sample_count": sum(
+                        item.condition == SampleCondition.REPLAY.value for item in split.train
+                    ),
+                    "held_out_source_only": True,
                     "session_separation": True,
                 },
                 "security_limitations": (
                     "VoiceGuard is not sufficient proof for payments, account security, or other high-risk actions.",
                     "Replay resistance is not inferred without real replay recordings.",
+                    "Augmented derivatives are training-only and are excluded from held-out metrics.",
                 ),
             }
         )
-        fingerprint_payload = {
-            "task": task.value,
-            "classes": classes,
-            "coefficients": coefficients,
-            "intercepts": intercepts,
-            "threshold": threshold,
-            "extractor": self.extractor.metadata.to_dict(),
-            "dataset_fingerprint": dataset_fingerprint,
-        }
-        base_metadata["model_version"] = model_fingerprint(fingerprint_payload)
-        model = CalibratedVoiceGuardModel(
+        unversioned_model = CalibratedVoiceGuardModel(
             task=task.value,
             classes=classes,
             coefficients=coefficients,
@@ -354,7 +432,10 @@ class VoiceGuardTrainer:
             authorized_labels=authorized_labels,
             extractor_metadata=self.extractor.metadata,
             metadata=base_metadata,
+            binary_positive_class=binary_positive_class,
         )
+        base_metadata["model_version"] = model_content_fingerprint(unversioned_model)
+        model = replace(unversioned_model, metadata=base_metadata)
         validation_report = evaluate_predictions(_observations(model, split.validation), threshold=threshold)
         test_report = evaluate_predictions(_observations(model, split.test), threshold=threshold)
         return TrainingResult(
@@ -449,14 +530,24 @@ def train_speaker_classifier(
     extractor: FeatureExtractor | None = None,
     config: TrainingConfig | None = None,
 ) -> TrainingResult:
-    """Train the owner/trusted/unknown classifier head on enrolled sessions."""
+    """Train an identity-labelled classifier from enrolled speaker sessions."""
 
-    selected = _task_config(
-        config,
-        task=TrainingTask.SPEAKER_AUTH,
-        authorized_labels=("owner", "trusted"),
-    )
+    base = config or TrainingConfig()
+    selected = replace(base, task=TrainingTask.SPEAKER_AUTH.value)
     trainer = VoiceGuardTrainer(extractor=extractor)
     if isinstance(source, VoiceDataset):
+        # Dataset speaker-auth labels are stable user IDs.  Leaving the
+        # default unset lets train_dataset resolve the enrolled owner/trusted
+        # identities instead of incorrectly treating role names as classes.
         return trainer.train_dataset(source, selected)
-    return trainer.train_examples(source, selected)
+    values = tuple(source)
+    if selected.authorized_labels is None:
+        inferred = tuple(
+            sorted({item.label for item in values if item.expected_authorized})
+        )
+        if not inferred:
+            raise DatasetError(
+                "speaker feature examples require an explicit or annotated authorized identity"
+            )
+        selected = replace(selected, authorized_labels=inferred)
+    return trainer.train_examples(values, selected)

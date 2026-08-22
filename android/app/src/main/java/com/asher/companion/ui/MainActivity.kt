@@ -11,7 +11,7 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.asher.companion.AsherApplication
 import com.asher.companion.R
-import com.asher.companion.pairing.PairingInvitation
+import com.asher.companion.protocol.PairingInvitation
 import com.asher.companion.security.AuthorizationContext
 import com.asher.companion.security.CompanionCapability
 import com.asher.companion.security.RequestSource

@@ -125,6 +125,14 @@ class CalibratedVoiceGuardModel:
 
     def score_and_label(self, features: Sequence[float]) -> tuple[float, str, dict[str, float]]:
         probabilities = self.predict_proba(features)
+        if self.task == "speaker_auth":
+            # Speaker authentication is identity-first.  Classify exactly one
+            # identity across every class, then authorize that same identity.
+            # Summing several authorized probabilities can otherwise turn an
+            # unknown argmax into an accepted (and potentially wrong) user.
+            predicted = max(probabilities, key=probabilities.get)
+            score = probabilities[predicted] if predicted in self.authorized_labels else 0.0
+            return float(score), predicted, probabilities
         authorized = {label: probabilities[label] for label in self.authorized_labels}
         if authorized:
             score = sum(authorized.values()) if len(authorized) > 1 else next(iter(authorized.values()))
@@ -135,17 +143,24 @@ class CalibratedVoiceGuardModel:
         return score, best_authorized, probabilities
 
     def verify_features(self, features: Sequence[float]) -> VerificationResult:
-        score, best_authorized, probabilities = self.score_and_label(features)
-        accepted = score >= self.threshold
+        score, predicted_class, probabilities = self.score_and_label(features)
+        accepted = (
+            predicted_class in self.authorized_labels
+            and score >= self.threshold
+        )
         if accepted:
-            predicted = best_authorized
-            reason = "authorized score met calibrated threshold"
+            predicted = predicted_class
+            reason = "predicted identity is authorized and met the calibrated threshold"
         else:
             predicted = "unknown" if self.task == "speaker_auth" else max(
                 probabilities,
                 key=probabilities.get,
             )
-            reason = "authorized score fell below calibrated threshold"
+            reason = (
+                "predicted identity is not authorized"
+                if predicted_class not in self.authorized_labels
+                else "predicted identity confidence fell below the calibrated threshold"
+            )
         return VerificationResult(
             accepted=accepted,
             predicted_label=predicted,
@@ -245,3 +260,33 @@ def model_fingerprint(payload: Mapping[str, Any]) -> str:
 
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def model_content_fingerprint(model: CalibratedVoiceGuardModel) -> str:
+    """Hash inference fields plus stable training-data provenance."""
+
+    dataset_metadata = model.metadata.get("dataset", {})
+    dataset_fingerprint = (
+        dataset_metadata.get("fingerprint")
+        if isinstance(dataset_metadata, Mapping)
+        else None
+    )
+
+    return model_fingerprint(
+        {
+            "task": model.task,
+            "classes": list(model.classes),
+            "coefficients": [list(row) for row in model.coefficients],
+            "intercepts": list(model.intercepts),
+            "feature_mean": list(model.feature_mean),
+            "feature_scale": list(model.feature_scale),
+            "threshold": model.threshold,
+            "authorized_labels": list(model.authorized_labels),
+            "binary_positive_class": model.binary_positive_class,
+            "extractor": model.extractor_metadata.to_dict(),
+            # A model bundle includes measured reports and provenance. Distinct
+            # independent datasets must not collide merely because they happen
+            # to fit identical weights.
+            "dataset_fingerprint": dataset_fingerprint,
+        }
+    )

@@ -40,7 +40,14 @@ from .metrics import (
     evaluate_predictions,
     observations_from_scores,
 )
-from .model import CalibratedVoiceGuardModel, VerificationResult
+from .model import CalibratedVoiceGuardModel, VerificationResult, model_content_fingerprint
+from .readiness import (
+    ReadinessIssue,
+    ReadinessPolicy,
+    SplitCoverage,
+    TrainingReadiness,
+    assess_dataset_readiness,
+)
 from .recording import RecordingSession, load_manifest
 from .schema import (
     SampleCondition,
@@ -51,6 +58,7 @@ from .schema import (
     TrainingTask,
 )
 from .training import (
+    TrainingArtifacts,
     TrainingConfig,
     TrainingResult,
     VoiceGuardTrainer,
@@ -84,6 +92,8 @@ __all__ = [
     "ModelError",
     "PcmAudio",
     "PretrainedEmbeddingAdapter",
+    "ReadinessIssue",
+    "ReadinessPolicy",
     "RecordingSession",
     "RecordingUnavailableError",
     "RevocationResult",
@@ -93,8 +103,11 @@ __all__ = [
     "SessionManifest",
     "SpeechBrainECAPAAdapter",
     "SpeakerRole",
+    "SplitCoverage",
     "StatisticalFeatureExtractor",
+    "TrainingArtifacts",
     "TrainingConfig",
+    "TrainingReadiness",
     "TrainingResult",
     "TrainingTask",
     "VerificationResult",
@@ -104,10 +117,12 @@ __all__ = [
     "augment_audio",
     "augment_session",
     "augment_wav",
+    "assess_dataset_readiness",
     "feature_examples_from_dataset",
     "load_dataset",
     "load_manifest",
     "ml_dependencies_available",
+    "model_content_fingerprint",
     "observations_from_scores",
     "prepare_positive_negative_examples",
     "prepare_training_examples",

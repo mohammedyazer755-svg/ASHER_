@@ -97,6 +97,30 @@ class AgentIntegrationTests(unittest.TestCase):
             continued = controller.handle_text("send hello to her", first)
             self.assertIsNotNone(continued.confirmation_id)
 
+    def test_disabled_long_term_memory_blocks_tools_without_weakening_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            session = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            controller.configure_memory(enabled=False, retention_days=90)
+            reply = controller.handle_text("what is my project goal", session)
+            self.assertIn("memory is disabled", reply.text.casefold())
+            self.assertIsNone(controller.loop.active)
+            self.assertFalse(controller.memory_enabled)
+            self.assertEqual(controller.memory_retention_days, 90)
+
+    def test_emotional_cue_is_practical_uncertain_and_non_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            controller.planner.openai = None
+            controller.planner.ollama = None
+            session = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            reply = controller.handle_text("I am frustrated and stuck", session)
+            lowered = reply.text.casefold()
+            self.assertIn("frustrating", lowered)
+            self.assertIn("practical step", lowered)
+            for prohibited in ("diagnosis", "disorder", "definitely feel", "depend on me"):
+                self.assertNotIn(prohibited, lowered)
+
 
 if __name__ == "__main__":
     unittest.main()

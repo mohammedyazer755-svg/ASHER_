@@ -6,7 +6,7 @@ import json
 import math
 import statistics
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ class VoiceFixture:
     expected_contact: str | None = None
     audio_path: str | None = None
     condition: str = "synthetic-text"
+    expected_task_success: bool | None = True
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class VoicePrediction:
     intent: str | None = None
     contact: str | None = None
     latency_ms: float | None = None
+    task_success: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -42,10 +44,13 @@ class VoiceEvaluationReport:
     contact_accuracy: float | None
     intent_case_count: int
     intent_accuracy: float | None
+    task_case_count: int
+    task_success_rate: float | None
     latency_sample_count: int
     median_latency_ms: float | None
     p95_latency_ms: float | None
     missing_prediction_count: int
+    by_condition: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -101,14 +106,24 @@ def evaluate_predictions(
     fixtures: Iterable[VoiceFixture],
     predictions: Iterable[VoicePrediction],
 ) -> VoiceEvaluationReport:
-    fixture_list = tuple(fixtures)
-    prediction_by_id = {item.fixture_id: item for item in predictions}
+    return _evaluate_predictions(tuple(fixtures), tuple(predictions), include_conditions=True)
+
+
+def _evaluate_predictions(
+    fixture_list: tuple[VoiceFixture, ...],
+    prediction_list: tuple[VoicePrediction, ...],
+    *,
+    include_conditions: bool,
+) -> VoiceEvaluationReport:
+    prediction_by_id = {item.fixture_id: item for item in prediction_list}
     total_errors = 0
     total_words = 0
     contact_cases = 0
     contact_correct = 0
     intent_cases = 0
     intent_correct = 0
+    task_cases = 0
+    task_correct = 0
     latencies: list[float] = []
     missing = 0
     for fixture in fixture_list:
@@ -122,6 +137,8 @@ def evaluate_predictions(
                 contact_cases += 1
             if fixture.expected_intent:
                 intent_cases += 1
+            if fixture.expected_task_success is not None:
+                task_cases += 1
             continue
         errors, words = word_error_counts(
             fixture.expected_transcript,
@@ -139,8 +156,27 @@ def evaluate_predictions(
             intent_cases += 1
             if prediction.intent == fixture.expected_intent:
                 intent_correct += 1
+        if fixture.expected_task_success is not None:
+            task_cases += 1
+            if prediction.task_success is fixture.expected_task_success:
+                task_correct += 1
         if prediction.latency_ms is not None and math.isfinite(prediction.latency_ms):
             latencies.append(max(0.0, float(prediction.latency_ms)))
+    by_condition: dict[str, dict[str, Any]] = {}
+    if include_conditions:
+        for condition in sorted({item.condition for item in fixture_list}):
+            condition_fixtures = tuple(
+                item for item in fixture_list if item.condition == condition
+            )
+            condition_ids = {item.fixture_id for item in condition_fixtures}
+            condition_predictions = tuple(
+                item for item in prediction_list if item.fixture_id in condition_ids
+            )
+            by_condition[condition] = _evaluate_predictions(
+                condition_fixtures,
+                condition_predictions,
+                include_conditions=False,
+            ).to_dict()
     return VoiceEvaluationReport(
         sample_count=len(fixture_list),
         total_reference_words=total_words,
@@ -150,10 +186,13 @@ def evaluate_predictions(
         contact_accuracy=(contact_correct / contact_cases if contact_cases else None),
         intent_case_count=intent_cases,
         intent_accuracy=(intent_correct / intent_cases if intent_cases else None),
+        task_case_count=task_cases,
+        task_success_rate=(task_correct / task_cases if task_cases else None),
         latency_sample_count=len(latencies),
         median_latency_ms=(statistics.median(latencies) if latencies else None),
         p95_latency_ms=_percentile(latencies, 0.95),
         missing_prediction_count=missing,
+        by_condition=by_condition,
     )
 
 
@@ -162,7 +201,16 @@ def generate_non_private_fixtures(count: int = 100) -> tuple[VoiceFixture, ...]:
 
     if count < 1:
         raise ValueError("count must be positive")
-    contacts = ("Avery Stone", "Jordan Reed", "Morgan Vale", "Riley North")
+    # Include a deliberately similar pair so contact accuracy reveals a
+    # near-name substitution instead of hiding it inside aggregate WER.
+    contacts = (
+        "Avery Stone",
+        "Jordan Reed",
+        "Morgan Vale",
+        "Riley North",
+        "Sara Vale",
+        "Sarah Vale",
+    )
     applications = ("Notepad", "Calculator", "Web Browser", "Text Editor")
     templates: list[tuple[str, str, str | None]] = []
     for contact in contacts:
@@ -195,7 +243,14 @@ def generate_non_private_fixtures(count: int = 100) -> tuple[VoiceFixture, ...]:
     output: list[VoiceFixture] = []
     for index in range(count):
         transcript, intent, contact = templates[index % len(templates)]
-        condition = ("quiet", "fan-noise", "household-noise")[index % 3]
+        condition = (
+            "quiet-near",
+            "quiet-far",
+            "fan-noise-near",
+            "fan-noise-far",
+            "household-noise-near",
+            "household-noise-far",
+        )[index % 6]
         output.append(
             VoiceFixture(
                 fixture_id=f"voice-{index + 1:04d}",
@@ -246,6 +301,7 @@ def evaluate_audio_fixtures(
                 intent=prediction.intent,
                 contact=prediction.contact,
                 latency_ms=prediction.latency_ms,
+                task_success=prediction.task_success,
             )
         predictions.append(prediction)
     return evaluate_predictions(fixture_list, predictions)
