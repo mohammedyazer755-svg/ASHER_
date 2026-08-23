@@ -18,6 +18,7 @@ from asher.core.redaction import contains_prohibited_secret, redact_text
 from asher.memory.retrieval import MemoryRetriever
 from asher.memory.store import MemoryStore
 from asher.memory.working import WorkingMemory
+from asher.preferences import PreferenceEvent, PreferenceStore
 from asher.brain.personality import infer_emotional_context
 from asher.security.audit import AuditLog
 from asher.security.sessions import SessionManager
@@ -37,6 +38,16 @@ class CompanionReply:
     confirmation_id: str | None = None
 
 
+@dataclass(frozen=True)
+class _PreferenceCandidate:
+    user_text: str
+    assistant_text: str
+    provider: str
+    offline: bool
+    confirmation_required: bool
+    tool_names: tuple[str, ...] = ()
+
+
 class CompanionController:
     def __init__(
         self,
@@ -51,6 +62,7 @@ class CompanionController:
         self.database = database or Database(self.config.runtime.database)
         self.memory_store = MemoryStore(self.database)
         self.memory_retriever = MemoryRetriever(self.memory_store)
+        self.preference_store = PreferenceStore(self.database)
         self.working_memory = WorkingMemory()
         self.audit = AuditLog(self.config.runtime.audit_log)
         self.users = UserStore(self.database)
@@ -83,6 +95,8 @@ class CompanionController:
         # owner turn into a trusted user's pronoun-based request.
         self._context_lock = threading.RLock()
         self._session_context: dict[str, dict[str, str]] = {}
+        self._preference_lock = threading.RLock()
+        self._preference_candidates: dict[str, _PreferenceCandidate] = {}
 
     def create_owner_session(self, method: AuthMethod = AuthMethod.LOCAL_UI) -> SessionContext:
         return self.sessions.create(self.owner, method)
@@ -122,6 +136,244 @@ class CompanionController:
     def _active_session(self, session: SessionContext) -> bool:
         return self._resolve_session(session) is not None
 
+    @property
+    def preference_learning_enabled(self) -> bool:
+        return self.preference_store.enabled
+
+    def configure_preference_learning(
+        self,
+        session: SessionContext,
+        *,
+        enabled: bool,
+    ) -> None:
+        active = self._resolve_session(session)
+        if active is None:
+            raise PermissionError("Authenticate again before changing PreferenceCore settings")
+        if active.actor.role is not Role.OWNER or active.actor.user_id != self.owner.user_id:
+            raise PermissionError("Only the owner can configure PreferenceCore")
+        self.preference_store.configure(enabled=enabled)
+        self.audit.append(
+            "preference_learning_setting",
+            actor_id=active.actor.user_id,
+            session_id=active.session_id,
+            outcome="enabled" if enabled else "disabled",
+        )
+
+    def list_preference_events(
+        self,
+        session: SessionContext,
+        *,
+        limit: int = 500,
+    ) -> tuple[PreferenceEvent, ...]:
+        active = self._resolve_session(session)
+        if active is None:
+            raise PermissionError("Authenticate again before reading PreferenceCore data")
+        return self.preference_store.list_events(
+            active.actor,
+            owner_id=self.owner.user_id,
+            limit=limit,
+        )
+
+    def delete_preference_event(
+        self,
+        session: SessionContext,
+        event_id: str,
+    ) -> bool:
+        active = self._resolve_session(session)
+        if active is None:
+            raise PermissionError("Authenticate again before deleting PreferenceCore data")
+        deleted = self.preference_store.delete(
+            active.actor,
+            owner_id=self.owner.user_id,
+            event_id=event_id,
+        )
+        if deleted:
+            self.audit.append(
+                "preference_feedback_delete",
+                actor_id=active.actor.user_id,
+                session_id=active.session_id,
+                outcome="complete",
+                details={"event_id": event_id},
+            )
+        return deleted
+
+    def _remember_preference_candidate(
+        self,
+        session: SessionContext,
+        *,
+        user_text: str,
+        assistant_text: str,
+        provider: str,
+        offline: bool,
+        confirmation_required: bool = False,
+        tool_names: tuple[str, ...] = (),
+    ) -> None:
+        # Safety/confirmation copy is not a trainable style target. PreferenceCore
+        # may change presentation style later, but it must never learn to weaken
+        # required previews or local policy messages.
+        if confirmation_required or provider in {"local-safety", "local-policy"}:
+            with self._preference_lock:
+                self._preference_candidates.pop(session.session_id, None)
+            return
+        if contains_prohibited_secret(user_text) or contains_prohibited_secret(assistant_text):
+            with self._preference_lock:
+                self._preference_candidates.pop(session.session_id, None)
+            return
+        candidate = _PreferenceCandidate(
+            user_text=redact_text(user_text).strip(),
+            assistant_text=redact_text(assistant_text).strip(),
+            provider=str(provider),
+            offline=bool(offline),
+            confirmation_required=False,
+            tool_names=tuple(str(item) for item in tool_names),
+        )
+        if not candidate.user_text or not candidate.assistant_text:
+            return
+        with self._preference_lock:
+            self._preference_candidates[session.session_id] = candidate
+
+    def _record_preference_feedback(
+        self,
+        session: SessionContext,
+        *,
+        feedback_kind: str,
+        preferred_text: str | None = None,
+    ) -> PreferenceEvent:
+        if session.actor.role is not Role.OWNER or session.actor.user_id != self.owner.user_id:
+            raise PermissionError("PreferenceCore feedback belongs to the owner profile")
+        with self._preference_lock:
+            candidate = self._preference_candidates.get(session.session_id)
+        if candidate is None:
+            raise LookupError("There is no eligible previous ASHER response in this session to label")
+        event = self.preference_store.record(
+            session.actor,
+            owner_id=self.owner.user_id,
+            session_id=session.session_id,
+            user_text=candidate.user_text,
+            assistant_text=candidate.assistant_text,
+            feedback_kind=feedback_kind,
+            preferred_text=preferred_text,
+            context={
+                "provider": candidate.provider,
+                "offline": candidate.offline,
+                "confirmation_required": candidate.confirmation_required,
+                "tool_names": list(candidate.tool_names),
+                "user_chars": len(candidate.user_text),
+                "assistant_chars": len(candidate.assistant_text),
+            },
+        )
+        with self._preference_lock:
+            self._preference_candidates.pop(session.session_id, None)
+        self.audit.append(
+            "preference_feedback",
+            actor_id=session.actor.user_id,
+            session_id=session.session_id,
+            outcome="recorded",
+            details={
+                "feedback_kind": event.feedback_kind,
+                "dimensions": list(event.dimensions),
+                "has_preferred_text": event.preferred_text is not None,
+                "tool_count": len(candidate.tool_names),
+            },
+        )
+        return event
+
+    def _handle_preference_control(
+        self,
+        text: str,
+        session: SessionContext,
+    ) -> CompanionReply | None:
+        lowered = text.casefold().strip()
+        is_control = lowered in {
+            "preference learning on",
+            "preference learning off",
+            "preference status",
+        } or lowered.startswith("feedback ")
+        if not is_control:
+            return None
+        if session.actor.role is not Role.OWNER or session.actor.user_id != self.owner.user_id:
+            return CompanionReply(
+                "PreferenceCore is available only to the owner profile.",
+                offline=True,
+                provider="preference-local",
+            )
+        if lowered == "preference learning on":
+            self.configure_preference_learning(session, enabled=True)
+            return CompanionReply(
+                "Preference learning is on. I will only save responses you explicitly label, and the data stays local.",
+                offline=True,
+                provider="preference-local",
+            )
+        if lowered == "preference learning off":
+            self.configure_preference_learning(session, enabled=False)
+            return CompanionReply(
+                "Preference learning is off. Existing local feedback stays stored until you delete it.",
+                offline=True,
+                provider="preference-local",
+            )
+        if lowered == "preference status":
+            state = "on" if self.preference_store.enabled else "off"
+            count = len(
+                self.preference_store.list_events(
+                    session.actor,
+                    owner_id=self.owner.user_id,
+                    limit=5000,
+                )
+            )
+            return CompanionReply(
+                f"Preference learning is {state}. Saved feedback examples: {count}.",
+                offline=True,
+                provider="preference-local",
+            )
+        if not self.preference_store.enabled:
+            return CompanionReply(
+                "Preference learning is off. Say 'preference learning on' before saving feedback.",
+                offline=True,
+                provider="preference-local",
+            )
+        payload = text[len("feedback "):].strip()
+        normalized = payload.casefold().strip()
+        aliases = {
+            "accept": "accept_response",
+            "good": "accept_response",
+            "reject": "reject_response",
+            "bad": "reject_response",
+            "shorter": "shorter",
+            "too verbose": "shorter",
+            "more detailed": "more_detailed",
+            "more detail": "more_detailed",
+            "more direct": "more_direct",
+            "ask less": "ask_less",
+            "ask more": "ask_more",
+            "suggest more": "suggest_more",
+            "suggest less": "suggest_less",
+        }
+        if normalized.startswith("preferred:"):
+            preferred = payload.split(":", 1)[1].strip()
+            event = self._record_preference_feedback(
+                session,
+                feedback_kind="preferred_reply",
+                preferred_text=preferred,
+            )
+        else:
+            kind = aliases.get(normalized)
+            if kind is None:
+                return CompanionReply(
+                    "Use feedback accept, reject, shorter, more detailed, more direct, ask less, ask more, suggest more, suggest less, or 'feedback preferred: ...'.",
+                    offline=True,
+                    provider="preference-local",
+                )
+            event = self._record_preference_feedback(
+                session,
+                feedback_kind=kind,
+            )
+        dimensions = ", ".join(event.dimensions)
+        return CompanionReply(
+            f"Saved as local PreferenceCore feedback ({dimensions}).",
+            offline=True,
+            provider="preference-local",
+        )
+
     def handle_text(self, text: str, session: SessionContext) -> CompanionReply:
         text = str(text).strip()
         if not text:
@@ -155,6 +407,9 @@ class CompanionController:
                 provider=self.planner.last_provider,
             )
         session = active_session
+        preference_control = self._handle_preference_control(text, session)
+        if preference_control is not None:
+            return preference_control
         context: dict[str, Any] = {"session": session}
         with self._context_lock:
             continuation = dict(self._session_context.get(session.session_id, {}))
@@ -208,12 +463,26 @@ class CompanionController:
                 provider=plan.provider,
                 offline=plan.offline,
             )
+            self._remember_preference_candidate(
+                session,
+                user_text=text,
+                assistant_text=response,
+                provider=plan.provider,
+                offline=plan.offline,
+            )
             return CompanionReply(response, offline=plan.offline, provider=plan.provider)
         if not plan.steps:
             response = plan.response or "I’m not sure how to help with that yet."
             self.loop.states.transition(
                 AssistantState.SUCCESS,
                 "Response ready",
+                provider=plan.provider,
+                offline=plan.offline,
+            )
+            self._remember_preference_candidate(
+                session,
+                user_text=text,
+                assistant_text=response,
                 provider=plan.provider,
                 offline=plan.offline,
             )
@@ -244,6 +513,15 @@ class CompanionController:
             else:
                 text_reply = "I do not have a non-sensitive memory matching that yet."
         self.working_memory.append(session.session_id, "assistant", redact_text(text_reply))
+        self._remember_preference_candidate(
+            session,
+            user_text=text,
+            assistant_text=text_reply,
+            provider=plan.provider,
+            offline=plan.offline,
+            confirmation_required=confirmation_id is not None,
+            tool_names=tuple(step.call.tool_name for step in plan.steps),
+        )
         return CompanionReply(text_reply, updates, offline=plan.offline, provider=plan.provider, confirmation_id=confirmation_id)
 
     @property

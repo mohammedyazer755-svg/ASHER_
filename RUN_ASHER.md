@@ -183,7 +183,42 @@ authentication; the export audit records only format/count metadata, never the
 destination or memory values. No legacy conversation history is imported
 automatically.
 
-## 8. VoiceGuard enrollment and training
+## 8. PreferenceCore feedback capture
+
+PreferenceCore is the local personalization dataset for teaching ASHER how the
+owner prefers the assistant to behave. It does **not** control permissions or
+security policy, and it is disabled by default so normal conversations are not
+silently collected as training data.
+
+Enable explicit capture from an authenticated owner session:
+
+```text
+preference learning on
+```
+
+After an ordinary ASHER response, label only that immediately preceding
+response with one of:
+
+```text
+feedback accept
+feedback reject
+feedback shorter
+feedback more detailed
+feedback more direct
+feedback ask less
+feedback ask more
+feedback suggest more
+feedback suggest less
+feedback preferred: Opening VS Code.
+```
+
+Use `preference status` to see whether capture is enabled and how many explicit
+examples are stored. `preference learning off` stops new capture without
+deleting existing examples. Confirmation previews, local safety messages and
+credential-like text are never eligible training examples. Feedback text stays
+in the local SQLite runtime store and is not sent to a model trainer yet.
+
+## 9. VoiceGuard enrollment and training
 
 VoiceGuard recording is consent-first. The UI's **Users & VoiceGuard** page
 asks for consent before a microphone sample is retained. If `sounddevice` or a
@@ -265,7 +300,7 @@ change. Model fitting runs outside the lifecycle lock; activation occurs only
 after a registry-and-dataset compare-and-swap, keeping revocation responsive and
 preventing a stale fit from resurrecting a model.
 
-## 9. Male/female voice switching and TTS
+## 10. Male/female voice switching and TTS
 
 Open **Settings -> Speech output** in the UI and choose `asher_male` or
 `asher_female`. The profile registry hides provider-specific voice IDs, so the
@@ -274,7 +309,7 @@ OpenAI TTS profiles are optional, disclose that speech is AI-generated, and
 fall back safely when unavailable. Pressing emergency stop interrupts active
 speech. The same interface is available through `asher.voice.tts.speak()`.
 
-## 10. Ollama and OpenAI
+## 11. Ollama and OpenAI
 
 Install Ollama separately, then pull the local model (only if you want that
 optional route):
@@ -290,7 +325,7 @@ uses a structured Responses API plan with minimal context and `store=false`.
 The code also supports the official audio transcription and TTS adapters, but
 no key or paid request is required for the tests.
 
-## 11. Tests and faculty demonstration
+## 12. Tests and faculty demonstration
 
 Run everything:
 
@@ -322,7 +357,7 @@ Suggested dry-run demo:
 6. Explain that no real WhatsApp message, deletion, booking, or payment is
    performed during the demo.
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 * **UI unavailable**: install `PySide6` in `.venv`; text mode is the supported
   fallback. On a headless test machine set `QT_QPA_PLATFORM=offscreen` only
@@ -349,7 +384,7 @@ Suggested dry-run demo:
   local environment has no Java, Gradle, SDK, ADB, or physical device, so the
   command-line build/device test remains pending.
 
-## 13. Adding a tool safely
+## 14. Adding a tool safely
 
 1. Create a focused module under `asher/tools/`.
 2. Define a JSON input schema with bounded lengths and
@@ -362,7 +397,7 @@ Suggested dry-run demo:
    authorization, dry-run, failure, and verification.
 6. Keep secrets and payloads out of `AuditLog`, prompts, tests, and UI details.
 
-## 14. Known limits
+## 15. Known limits
 
 The source includes an Android protocol/app scaffold, but this checkout has no
 Gradle wrapper and the local machine has no Java/Android SDK/device toolchain,
@@ -371,7 +406,7 @@ VoiceGuard dataset, optional model downloads, Ollama's Qwen model, an OpenAI
 key, Windows Hello, and live external-action observation are intentionally not
 fabricated. See `PROJECT_PROGRESS.md` for exact evidence and next actions.
 
-## VoiceGuard real-data collection
+## 16. VoiceGuard real-data collection
 
 Use the guided collector for real speaker-auth sessions. It keeps raw audio in ASHER's private runtime directory; do not copy those WAV files into the project or upload them.
 

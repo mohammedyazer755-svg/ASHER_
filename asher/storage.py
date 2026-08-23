@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class _ManagedConnection(sqlite3.Connection):
@@ -120,6 +120,24 @@ class Database:
                     setting_value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS preference_events (
+                    event_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    user_text TEXT NOT NULL,
+                    assistant_text TEXT NOT NULL,
+                    preferred_text TEXT,
+                    feedback_kind TEXT NOT NULL,
+                    dimensions_json TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    deleted_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS preference_owner_active
+                ON preference_events(owner_id, deleted_at, created_at);
                 """
             )
             connection.execute(

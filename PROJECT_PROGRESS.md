@@ -1,3 +1,30 @@
+## Continuation update — PreferenceCore Phase PC-1A: explicit local preference capture (2026-08-23)
+
+### Goal locked
+- ASHER is being built as a local-first personal agent, not merely a chatbot with automation. The long-term target is an assistant that can identify the owner, remember useful context, execute authorized digital work, recover from failures, and increasingly behave the way the owner prefers.
+- VoiceGuard learns **who is speaking**. PreferenceCore will learn **how the owner prefers ASHER to behave**: brevity, directness, clarification tendency, proactive suggestions, failure-report detail and preferred response wording.
+- PreferenceCore must never learn or override permissions, confirmations, strong authentication, emergency-stop behavior, or other deterministic security policy.
+
+### Implemented in PC-1A
+- Added `asher/preferences/` with typed feedback records and an owner-only SQLite store.
+- Preference capture is opt-in and disabled by default. Normal conversation is never silently turned into training data.
+- ASHER keeps only the immediately preceding eligible response in memory as a temporary feedback candidate; it is persisted only when the owner explicitly labels it.
+- Local text/voice control commands: `preference learning on/off`, `preference status`, `feedback accept/reject`, `feedback shorter/more detailed/more direct`, `feedback ask less/ask more`, `feedback suggest more/suggest less`, and `feedback preferred: <exact preferred reply>`.
+- Safety-policy and confirmation-preview responses are excluded from trainable candidates. Credential-like content is rejected rather than stored.
+- Stored context is bounded metadata only: provider/offline flag, allowed tool names and response lengths; tool arguments and secret values are not copied into PreferenceCore context.
+- Feedback can be listed/deleted only through a live owner session. Audit records capture feedback type/dimensions only and omit conversation text.
+- SQLite schema advances to version 2 with a soft-deletable `preference_events` table.
+
+### Verification in handoff environment
+- New PreferenceCore tests: **6/6 passed**.
+- Full suite discovers **209 tests** after PC-1A (203 prior + 6 new). In this handoff environment, Qt tests are skipped and the same three previously-known VoiceGuard lazy-import checks fail because optional numerical modules are preloaded; Windows `run_tests.ps1` remains authoritative.
+- `python -m compileall -q asher tests`: PASS.
+
+### Exact next action
+Apply PC-1A to the owner's current clean checkpoint, run the full Windows suite, and require **209 tests passed**. Then use ASHER normally with PreferenceCore enabled and collect genuine explicit feedback before training any personalization model. PC-1B will add dataset inspection/quality summaries; model training starts only after enough real owner-labelled examples exist.
+
+---
+
 ## Continuation note — authoritative exact UI specification received (2026-08-22)
 
 - The owner supplied `ASHER_EXACT_UI_SPEC.md` as the authoritative visual and interaction reference for future UI work. Its contents are UI requirements and constraints, not authorization to rewrite ASHER's security, VoiceGuard, memory, planner, tools, providers, voice pipeline, or Android protocol.
