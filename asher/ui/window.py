@@ -135,15 +135,15 @@ else:
     QLabel#state { color: #a7f3d0; font-size: 12pt; font-weight: 700; }
     QLabel#orbState { color: #f4f7fb; font-size: 17pt; font-weight: 700; }
     QLabel#orbMessage { color: #aebdd1; font-size: 11pt; }
-    QFrame#orbStage { background: #05070b; border: 1px solid #182233; border-radius: 22px; }
-    QWidget#companionMode { background: #02060b; border: 0; }
-    QLabel#companionBrand { color: #dff8ff; font-size: 10pt; font-weight: 650; letter-spacing: 4px; }
+    QFrame#orbStage { background: #02050b; border: 1px solid rgba(121, 223, 255, 45); border-radius: 22px; }
+    QWidget#companionMode { background: #02050b; border: 0; }
+    QLabel#companionBrand { color: #e9fbff; font-size: 10pt; font-weight: 650; letter-spacing: 4px; }
     QLabel#companionState { color: #f4f7fb; font-size: 16pt; font-weight: 650; }
     QLabel#companionMessage { color: #9cb0c1; font-size: 10pt; }
-    QLabel#companionTelemetry { color: #71889a; font-size: 8pt; letter-spacing: 1px; padding-right: 8px; }
+    QLabel#companionTelemetry { background: rgba(121, 223, 255, 16); color: #aeeeff; border: 1px solid rgba(121, 223, 255, 38); border-radius: 9px; font-size: 8pt; letter-spacing: 1px; padding: 5px 10px; }
     QPushButton#companionStop { background: rgba(66, 18, 28, 150); color: #ffcbd3; border: 1px solid rgba(199, 70, 90, 135); border-radius: 9px; padding: 6px 13px; font-weight: 700; }
     QPushButton#companionStop:hover { background: rgba(111, 27, 42, 190); }
-    QFrame#companionConfirm { background: rgba(5, 9, 14, 232); border: 1px solid rgba(255, 180, 74, 120); border-radius: 10px; }
+    QFrame#companionConfirm { background: rgba(7, 27, 44, 232); border: 1px solid rgba(255, 180, 74, 120); border-radius: 12px; }
     QLabel#statusChip { background: #1b3150; color: #bcd7f7; border-radius: 10px; padding: 5px 10px; }
     QLabel#warning { background: #4b3416; color: #ffd994; border: 1px solid #916721; border-radius: 8px; padding: 8px; }
     QLabel#danger { color: #ffb4b4; }
@@ -232,6 +232,7 @@ else:
             stage_layout.setSpacing(7)
             stage_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.orb = AsherOrbWidget(stage)
+            self.orb.set_cinematic_mode(True)
             stage_layout.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter)
             self.state = _label("STANDBY", "orbState")
             self.state.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -320,6 +321,14 @@ else:
             super().__init__()
             self.window = window
             self.setObjectName("companionMode")
+            # QWidget style backgrounds are platform-dependent unless the
+            # widget explicitly paints its Window role.  Match the cinematic
+            # canvas exactly so the square orb widget can never be visible.
+            self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            companion_palette = self.palette()
+            companion_palette.setColor(QPalette.ColorRole.Window, QColor("#02050B"))
+            self.setPalette(companion_palette)
+            self.setAutoFillBackground(True)
             root = QVBoxLayout(self)
             self.root_layout = root
             root.setContentsMargins(24, 16, 24, 18)
@@ -821,6 +830,7 @@ else:
             self._companion_restore_pending = False
             self._restore_maximized_after_companion = False
             self._restore_fullscreen_after_companion = False
+            self._audio_poll_enabled = False
             self.setWindowTitle("Asher — authenticated personal companion")
             self.setMinimumSize(1120, 720)
             self.resize(1320, 820)
@@ -839,6 +849,13 @@ else:
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._refresh_status)
             self._timer.start(500)
+            # Full status/view refresh remains deliberately slow.  A small
+            # presentation-only poll lets real microphone RMS reach the orb in
+            # time to feel continuous without rebuilding any page content.
+            self._audio_timer = QTimer(self)
+            self._audio_timer.setInterval(66)
+            self._audio_timer.timeout.connect(self._refresh_orb_audio)
+            self._sync_audio_timer()
 
         def _build_shell(self) -> None:
             self.mode_stack = QStackedWidget()
@@ -1049,12 +1066,47 @@ else:
             except Exception:
                 pass
 
+        def _sync_audio_timer(self) -> None:
+            """Run the high-rate presentation poll only while a mic is active."""
+
+            if self._audio_poll_enabled:
+                if not self._audio_timer.isActive():
+                    self._audio_timer.start()
+                return
+            self._audio_timer.stop()
+
+        def _refresh_orb_audio(self) -> None:
+            """Feed only the latest real microphone scalar to both orb views."""
+
+            if not self._audio_poll_enabled:
+                return
+            try:
+                status = self.controller.status()
+            except Exception:
+                self._audio_poll_enabled = False
+                self.home.orb.set_audio_level(0.0)
+                self.companion_mode.orb.set_audio_level(0.0)
+                self._sync_audio_timer()
+                return
+            self._audio_poll_enabled = bool(status.microphone_active)
+            level = (
+                getattr(status, "microphone_level", 0.0)
+                if self._audio_poll_enabled
+                else 0.0
+            )
+            self.home.orb.set_audio_level(level)
+            self.companion_mode.orb.set_audio_level(level)
+            self._sync_audio_timer()
+
         def _refresh_status(self) -> None:
             try:
                 status = self.controller.status()
             except Exception as error:
                 self._show_error(f"Status unavailable: {error}")
                 return
+            self._audio_poll_enabled = bool(status.microphone_active)
+            if hasattr(self, "_audio_timer"):
+                self._sync_audio_timer()
             state_text = status.state.value.upper().replace("_", " ")
             self.header_state.setText(state_text)
             self.header_state.setStyleSheet("color: #ffb4b4;" if status.state == AssistantState.ERROR else "")
@@ -1322,6 +1374,7 @@ else:
 
         def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback name
             self._timer.stop()
+            self._audio_timer.stop()
             if self._state_unsubscribe is not None:
                 self._state_unsubscribe()
                 self._state_unsubscribe = None

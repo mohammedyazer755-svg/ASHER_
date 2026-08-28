@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,63 @@ _CINEMATIC_SPARK_COUNT = 11
 _CINEMATIC_TRAJECTORY_COUNT = 3
 _CINEMATIC_WISP_COUNT = 7
 
+# The cinematic orb is always rendered as ice-blue glass.  Canonical state
+# colours are still available to the surrounding status/confirmation UI, but
+# the living surface itself keeps one calm visual identity.
+_GLASS_BACKGROUND = "#04101B"
+_GLASS_PRIMARY = "#79DFFF"
+_GLASS_SECONDARY = "#C8F3FF"
+_GLASS_HIGHLIGHT = "#F7FDFF"
+_GLASS_DEPTH = "#184D79"
+
+# Real microphone RMS is deliberately quiet compared with a normalized peak.
+# Lift values above the runtime's speech gate into a useful visual range while
+# keeping presentation noise at (or very close to) zero.
+_AUDIO_ACTIVITY_FLOOR = 0.008
+_AUDIO_ACTIVITY_CEILING = 0.18
+_CINEMATIC_IDLE_SCALE = 0.70
+_CINEMATIC_VOICE_SCALE = 0.98
+
+
+def _bounded_scalar(value: Any) -> float:
+    """Return a finite 0..1 scalar for presentation-only inputs."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return max(0.0, min(1.0, number))
+
+
+def audio_activity_for_level(level: Any) -> float:
+    """Map real microphone RMS to a perceptually useful 0..1 activity value."""
+
+    sample = _bounded_scalar(level)
+    normalized = max(
+        0.0,
+        min(
+            1.0,
+            (sample - _AUDIO_ACTIVITY_FLOOR)
+            / (_AUDIO_ACTIVITY_CEILING - _AUDIO_ACTIVITY_FLOOR),
+        ),
+    )
+    # Square-root compression gives ordinary speech useful travel long before
+    # PCM approaches a theoretical full-scale peak.  The scale function below
+    # applies the final smoothstep, so the quiet boundary still stays calm.
+    return math.sqrt(normalized)
+
+
+def cinematic_scale_for_activity(activity: Any) -> float:
+    """Return the bounded quiet-to-voice scale used by the glass sphere."""
+
+    amount = _bounded_scalar(activity)
+    eased = amount * amount * (3.0 - 2.0 * amount)
+    return _CINEMATIC_IDLE_SCALE + (
+        _CINEMATIC_VOICE_SCALE - _CINEMATIC_IDLE_SCALE
+    ) * eased
+
 _STATE_VISUALS: dict[AssistantState, OrbVisual] = {
     AssistantState.STANDBY: OrbVisual("#55D6FF", "#3D69FF", "#8D9AAC", 0.42, 0.08, 14, 'Say "Hey Asher"'),
     AssistantState.WAKE_DETECTED: OrbVisual("#74E4FF", "#55D6FF", "#F4F7FB", 1.45, 0.22, 24, "Wake detected"),
@@ -62,6 +120,17 @@ _STATE_VISUALS: dict[AssistantState, OrbVisual] = {
     AssistantState.ACTING: OrbVisual("#FFB44A", "#FF8B45", "#FFF0DC", 1.25, 0.13, 22, "Acting..."),
     AssistantState.COMPLETE: OrbVisual("#62E6A7", "#49CFA1", "#E8FFF5", 0.45, 0.10, 16, "Complete"),
 }
+
+_SEMANTIC_ACCENT_STATES = frozenset(
+    {
+        AssistantState.AWAITING_CONFIRMATION,
+        AssistantState.SUCCESS,
+        AssistantState.COMPLETE,
+        AssistantState.ERROR,
+        AssistantState.STOPPED,
+        AssistantState.LOCKED,
+    }
+)
 
 
 def visual_for_state(state: AssistantState) -> OrbVisual:
@@ -118,6 +187,9 @@ else:
             self._visual = visual_for_state(self._state)
             self._phase = 0.0
             self._audio_level = 0.0
+            self._audio_sample_deadline = time.monotonic()
+            self._display_activity = 0.0
+            self._last_frame_time = time.monotonic()
             self._reduced_motion = False
             self._animation_intensity = 1.0
             self._interactive_resize = False
@@ -128,6 +200,8 @@ else:
             self._overlay_title = ""
             self._overlay_message = ""
             self._font_family = self._resolve_font_family()
+            self.setAccessibleName("Asher voice orb")
+            self.setAccessibleDescription(self._visual.label)
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._advance)
             self._sync_timer()
@@ -167,7 +241,20 @@ else:
                 return
             self._state = state
             self._visual = visual_for_state(state)
-            self._audio_level = 0.0 if state != AssistantState.SPEAKING else self._audio_level
+            if state not in {
+                AssistantState.STANDBY,
+                AssistantState.WAKE_DETECTED,
+                AssistantState.LISTENING,
+                AssistantState.SPEAKING,
+            }:
+                self._audio_level = 0.0
+            self.setAccessibleDescription(
+                f"{state.value.replace('_', ' ')}. {self._visual.label}"
+            )
+            if self._reduced_motion:
+                self._display_activity = self._reduced_motion_activity()
+            elif not self.isVisible():
+                self._display_activity = self._target_activity()
             self._sync_timer()
             self.update()
 
@@ -179,22 +266,44 @@ else:
             self.update()
 
         def set_overlay_text(self, title: str, message: str = "") -> None:
-            """Set truthful state/message text painted inside the cinematic sphere."""
+            """Keep truthful state/message copy available to accessibility tools."""
 
             self._overlay_title = str(title or "").strip()
             self._overlay_message = str(message or "").strip()
+            accessible_parts = [
+                part
+                for part in (
+                    self._overlay_title,
+                    self._overlay_message or self._visual.label,
+                )
+                if part
+            ]
+            self.setAccessibleDescription(". ".join(accessible_parts))
             if self.isVisible():
                 self.update()
 
         def set_audio_level(self, level: float) -> None:
             """Accept a short-lived normalized level without retaining audio."""
 
-            self._audio_level = max(0.0, min(1.0, float(level)))
-            if self.isVisible():
+            self._audio_level = _bounded_scalar(level)
+            self._audio_sample_deadline = time.monotonic() + (
+                0.14 if self._audio_level > _AUDIO_ACTIVITY_FLOOR else 0.0
+            )
+            if not self.isVisible() and not self._reduced_motion:
+                self._display_activity = self._target_activity()
+            self._sync_timer()
+            if (
+                self.isVisible()
+                and not self._reduced_motion
+                and self._animation_intensity > 0.0
+            ):
                 self.update()
 
         def set_reduced_motion(self, enabled: bool) -> None:
             self._reduced_motion = bool(enabled)
+            if self._reduced_motion:
+                self._display_activity = self._reduced_motion_activity()
+            self._last_frame_time = time.monotonic()
             self._sync_timer()
             self.update()
 
@@ -254,11 +363,63 @@ else:
 
         def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback
             super().showEvent(event)
+            self._last_frame_time = time.monotonic()
             self._sync_timer()
 
         def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback
             self._timer.stop()
             super().hideEvent(event)
+
+        def _reduced_motion_activity(self) -> float:
+            """Keep state legible without continuously reacting to waveform data."""
+
+            if self._state is AssistantState.SPEAKING:
+                return 0.82
+            if self._state in {
+                AssistantState.WAKE_DETECTED,
+                AssistantState.AUTHENTICATING,
+                AssistantState.AUTHENTICATED,
+            }:
+                return 0.30
+            return 0.0
+
+        def _target_activity(self) -> float:
+            """Combine truthful state and real microphone energy for animation."""
+
+            microphone = audio_activity_for_level(self._audio_level)
+            if self._state is AssistantState.SPEAKING:
+                # No TTS waveform is exposed.  The canonical SPEAKING state is
+                # truthful, so it may expand the orb without inventing audio.
+                return 0.90
+            if self._state is AssistantState.WAKE_DETECTED:
+                return max(0.50, microphone)
+            if self._state in {AssistantState.STANDBY, AssistantState.LISTENING}:
+                return microphone
+            if self._state in {
+                AssistantState.AUTHENTICATING,
+                AssistantState.AUTHENTICATED,
+                AssistantState.TRANSCRIBING,
+                AssistantState.UNDERSTANDING,
+                AssistantState.THINKING,
+                AssistantState.AWAITING_CONFIRMATION,
+                AssistantState.EXECUTING,
+                AssistantState.ACTING,
+                AssistantState.OBSERVING,
+            }:
+                return 0.24
+            return 0.0
+
+        def _render_activity(self) -> float:
+            if self._reduced_motion:
+                return self._reduced_motion_activity()
+            return _bounded_scalar(
+                self._display_activity * self._animation_intensity
+            )
+
+        def current_visual_scale(self) -> float:
+            """Expose the painted scale for accessibility and regression tests."""
+
+            return cinematic_scale_for_activity(self._render_activity())
 
         def _sync_timer(self) -> None:
             if self._reduced_motion or self._animation_intensity <= 0.0:
@@ -274,7 +435,7 @@ else:
                 AssistantState.LOCKED,
                 AssistantState.SUCCESS,
                 AssistantState.COMPLETE,
-            }
+            } or self._audio_level > _AUDIO_ACTIVITY_FLOOR or self._display_activity > 0.02
             interval = 33 if active else 70
             if self._timer.interval() != interval:
                 self._timer.setInterval(interval)
@@ -285,10 +446,44 @@ else:
             if not self.isVisible():
                 self._timer.stop()
                 return
-            self._phase = (self._phase + 0.035 * self._visual.speed * self._animation_intensity) % (math.tau * 100)
-            # Presentation-only audio influence decays rapidly and never changes state.
-            self._audio_level *= 0.82
+            now = time.monotonic()
+            elapsed = max(0.001, min(0.12, now - self._last_frame_time))
+            self._last_frame_time = now
+            self._phase = (
+                self._phase
+                + elapsed * 1.06 * self._visual.speed * self._animation_intensity
+            ) % (math.tau * 100)
+            self._decay_audio_sample(now, elapsed)
+            self._advance_activity(elapsed)
+            if self._target_activity() <= 0.0 and self._display_activity < 0.02:
+                self._sync_timer()
             self.update()
+
+        def _decay_audio_sample(self, now: float, elapsed: float) -> float:
+            """Release a presentation sample if its producer stops refreshing it."""
+
+            if (
+                self._audio_level <= 0.0
+                or now <= self._audio_sample_deadline
+            ):
+                return self._audio_level
+            decay_time = min(max(0.0, float(elapsed)), now - self._audio_sample_deadline)
+            self._audio_level *= math.exp(-decay_time / 0.16)
+            if self._audio_level < _AUDIO_ACTIVITY_FLOOR:
+                self._audio_level = 0.0
+            return self._audio_level
+
+        def _advance_activity(self, elapsed: float) -> float:
+            """Advance the fast-attack/soft-release envelope by real time."""
+
+            duration = max(0.0, min(0.25, float(elapsed)))
+            target = self._target_activity()
+            time_constant = 0.075 if target > self._display_activity else 0.30
+            blend = 1.0 - math.exp(-duration / time_constant)
+            self._display_activity += (target - self._display_activity) * blend
+            if abs(target - self._display_activity) < 0.001:
+                self._display_activity = target
+            return self._display_activity
 
         def paintEvent(self, _event: Any) -> None:  # noqa: N802 - Qt callback
             painter = QPainter(self)
@@ -299,21 +494,29 @@ else:
             height = float(self.height())
             center = QPointF(width / 2.0, height / 2.0)
             extent = min(width, height)
-            activity = self._audio_level if self._state in {AssistantState.LISTENING, AssistantState.SPEAKING} else 0.0
-            pulse = math.sin(self._phase * 2.1) * self._visual.pulse * self._animation_intensity
+            activity = self._render_activity()
+            breath = 0.0
+            if not self._reduced_motion:
+                breath = (
+                    math.sin(self._phase * 1.42) * 0.012
+                    + activity * math.sin(self._phase * 3.15 + 0.8) * 0.026
+                    + activity * math.sin(self._phase * 5.7) * 0.010
+                ) * self._animation_intensity
 
             if self._cinematic_mode:
-                # The visible corona extends to roughly 1.4x this radius.  A
-                # slightly smaller body keeps that energetic rim on-screen at
-                # the responsive 1366x768 layout size.
+                # The fixed canvas never reflows.  Only the painted glass body
+                # grows, from a quiet 70% presence to a voice-active 98% one.
                 base_radius = extent * 0.320
-                radius = base_radius * (1.0 + pulse * 0.34 + activity * 0.075)
+                radius = base_radius * self.current_visual_scale() * (1.0 + breath)
                 self._paint_cinematic(painter, center, radius, width, height)
                 return
 
-            base_radius = extent * 0.205
-            radius = base_radius * (1.0 + pulse + activity * 0.10)
-            painter.fillRect(self.rect(), QColor("#05070B"))
+            compact_scale = 0.72 + 0.28 * (
+                activity * activity * (3.0 - 2.0 * activity)
+            )
+            base_radius = extent * 0.270
+            radius = base_radius * compact_scale * (1.0 + breath)
+            painter.fillRect(self.rect(), QColor(_GLASS_BACKGROUND))
             self._draw_ambient_glow(painter, center, radius)
             self._draw_particles(painter, center, radius)
             self._draw_orbits(painter, center, radius)
@@ -327,26 +530,20 @@ else:
             width: float,
             height: float,
         ) -> None:
-            """Render the minimal active-companion scene.
+            """Render an open atomic-energy form inspired by the owner reference."""
 
-            The visual is intentionally not a dashboard.  The sphere is the
-            interface; detailed runtime information stays in Workspace mode.
-            """
-
-            painter.fillRect(self.rect(), QColor("#02060B"))
-            self._draw_starfield(painter, width, height)
-            self._draw_cinematic_glow(painter, center, radius)
-            self._draw_cinematic_body(painter, center, radius)
-            self._draw_internal_wisps(painter, center, radius)
-            self._draw_inner_filaments(painter, center, radius)
-            self._draw_energy_orbits(painter, center, radius)
-            self._draw_hot_core(painter, center, radius)
-            self._draw_plasma_shell(painter, center, radius)
-            self._draw_cinematic_particles(painter, center, radius)
-            self._draw_cinematic_text(painter, center, radius)
+            painter.fillRect(self.rect(), QColor("#02050B"))
+            self._draw_atomic_ambient(painter, center, radius)
+            self._draw_atomic_particles(painter, center, radius, foreground=False)
+            self._draw_atomic_ribbons(painter, center, radius, foreground=False)
+            self._draw_atomic_mesh(painter, center, radius)
+            self._draw_atomic_spikes(painter, center, radius)
+            self._draw_atomic_core(painter, center, radius)
+            self._draw_atomic_ribbons(painter, center, radius, foreground=True)
+            self._draw_atomic_particles(painter, center, radius, foreground=True)
 
         def _draw_starfield(self, painter: QPainter, width: float, height: float) -> None:
-            primary = QColor(self._visual.primary)
+            primary = QColor(_GLASS_PRIMARY)
             for index in range(34):
                 x = ((index * 149 + 31) % 997) / 997.0 * width
                 y = ((index * 263 + 73) % 991) / 991.0 * height
@@ -358,6 +555,364 @@ else:
                 size = 0.55 + (index % 3) * 0.55
                 painter.drawEllipse(QPointF(x + drift, y), size, size)
 
+        @staticmethod
+        def _atomic_point(
+            center: QPointF,
+            radius: float,
+            coordinates: tuple[float, float],
+        ) -> QPointF:
+            return QPointF(
+                center.x() + coordinates[0] * radius,
+                center.y() + coordinates[1] * radius,
+            )
+
+        def _draw_atomic_ambient(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+        ) -> None:
+            """Paint bloom around an open form without creating a solid shell."""
+
+            energy = self._cinematic_energy()
+            primary = QColor(_GLASS_PRIMARY)
+            glow_radius = radius * 1.46
+            glow = QRadialGradient(center, glow_radius)
+            glow.setColorAt(0.0, QColor(247, 253, 255, round(18 * energy)))
+            glow.setColorAt(
+                0.12,
+                QColor(primary.red(), primary.green(), primary.blue(), round(24 * energy)),
+            )
+            glow.setColorAt(
+                0.34,
+                QColor(primary.red(), primary.green(), primary.blue(), round(13 * energy)),
+            )
+            glow.setColorAt(
+                0.68,
+                QColor(primary.red(), primary.green(), primary.blue(), round(4 * energy)),
+            )
+            glow.setColorAt(1.0, QColor(primary.red(), primary.green(), primary.blue(), 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(glow))
+            painter.drawEllipse(center, glow_radius, glow_radius)
+
+        def _draw_atomic_mesh(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+        ) -> None:
+            """Draw the dense curved/chorded energy lattice around the nucleus."""
+
+            mesh_radius = radius * 0.82
+            energy = self._cinematic_energy()
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_SECONDARY)
+            hot = QColor(_GLASS_HIGHLIGHT)
+            clip = QPainterPath()
+            clip.addEllipse(center, mesh_radius * 1.035, mesh_radius * 1.035)
+            painter.save()
+            painter.setClipPath(clip)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+            # Rotated narrow ellipses establish the globe-like atomic volume.
+            for index in range(16):
+                painter.save()
+                painter.translate(center)
+                painter.rotate(
+                    index * 22.5
+                    + math.degrees(self._phase) * (0.010 if index % 2 else -0.008)
+                )
+                major = mesh_radius * (0.72 + (index % 5) * 0.055)
+                minor = mesh_radius * (0.16 + (index % 6) * 0.075)
+                color = QColor(secondary if index % 4 == 0 else primary)
+                color.setAlpha(round((40 + (index % 4) * 12) * energy))
+                pen = QPen(color, 0.55 + (index % 3) * 0.16)
+                painter.setPen(pen)
+                painter.drawEllipse(QRectF(-major, -minor, major * 2.0, minor * 2.0))
+                painter.restore()
+
+            # A deterministic web of curved chords supplies the reference's
+            # tangled filament density without storing or loading an asset.
+            for index in range(62):
+                start_angle = index * 2.399963 + self._phase * (
+                    0.010 if index % 2 else -0.008
+                )
+                angle_span = 0.72 + ((index * 37) % 97) / 97.0 * 2.75
+                end_angle = start_angle + angle_span
+                start_radius = mesh_radius * (0.79 + ((index * 17) % 19) / 95.0)
+                end_radius = mesh_radius * (0.77 + ((index * 29) % 23) / 100.0)
+                start = QPointF(
+                    center.x() + math.cos(start_angle) * start_radius,
+                    center.y() + math.sin(start_angle) * start_radius,
+                )
+                end = QPointF(
+                    center.x() + math.cos(end_angle) * end_radius,
+                    center.y() + math.sin(end_angle) * end_radius,
+                )
+                bend = ((index * 43) % 31 - 15) / 15.0
+                control_one_radius = mesh_radius * (0.31 + 0.08 * bend)
+                control_two_radius = mesh_radius * (0.33 - 0.07 * bend)
+                control_one = QPointF(
+                    center.x() + math.cos(start_angle + 0.56) * control_one_radius,
+                    center.y() + math.sin(start_angle + 0.56) * control_one_radius,
+                )
+                control_two = QPointF(
+                    center.x() + math.cos(end_angle - 0.61) * control_two_radius,
+                    center.y() + math.sin(end_angle - 0.61) * control_two_radius,
+                )
+                filament = QPainterPath(start)
+                filament.cubicTo(control_one, control_two, end)
+                color = QColor(hot if index % 11 == 0 else primary)
+                color.setAlpha(round((54 + (index % 6) * 13) * energy))
+                pen = QPen(color, 0.48 + (index % 4) * 0.15)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.drawPath(filament)
+            painter.restore()
+
+            # Broken boundary fragments imply a globe without enclosing it in
+            # the rejected continuous glass ring.
+            boundary = QRectF(
+                center.x() - mesh_radius,
+                center.y() - mesh_radius,
+                mesh_radius * 2.0,
+                mesh_radius * 2.0,
+            )
+            edge = QColor(primary)
+            edge.setAlpha(round(74 * energy))
+            edge_pen = QPen(edge, 0.8)
+            edge_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(edge_pen)
+            for start, span in ((7, 44), (92, 31), (169, 48), (266, 35)):
+                painter.drawArc(boundary, start * 16, span * 16)
+
+        def _draw_atomic_spikes(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+        ) -> None:
+            """Emit uneven core-fed rays beyond the filament globe."""
+
+            activity = self._render_activity()
+            energy = self._cinematic_energy()
+            count = 17 + round(activity * 8)
+            primary = QColor(_GLASS_PRIMARY)
+            hot = QColor(_GLASS_HIGHLIGHT)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for index in range(count):
+                angle = index * 2.399963 + self._phase * (
+                    0.020 if index % 2 else -0.014
+                )
+                inner_radius = radius * (0.06 if index % 4 == 0 else 0.18 + (index % 3) * 0.07)
+                reach = (
+                    0.73
+                    + ((index * 41) % 37) / 100.0
+                    + activity * (0.12 + (index % 4) * 0.025)
+                )
+                outer_radius = radius * reach
+                start = QPointF(
+                    center.x() + math.cos(angle) * inner_radius,
+                    center.y() + math.sin(angle) * inner_radius,
+                )
+                end = QPointF(
+                    center.x() + math.cos(angle) * outer_radius,
+                    center.y() + math.sin(angle) * outer_radius,
+                )
+                glow = QColor(primary)
+                glow.setAlpha(round((18 + activity * 22) * energy))
+                painter.setPen(QPen(glow, 2.5 + (index % 3) * 0.7))
+                painter.drawLine(start, end)
+                ray = QLinearGradient(start, end)
+                bright = QColor(hot)
+                bright.setAlpha(min(255, round((142 + activity * 72) * energy)))
+                blue = QColor(primary)
+                blue.setAlpha(round((108 + activity * 62) * energy))
+                clear = QColor(primary)
+                clear.setAlpha(0)
+                ray.setColorAt(0.0, bright)
+                ray.setColorAt(0.62, blue)
+                ray.setColorAt(1.0, clear)
+                ray_pen = QPen(QBrush(ray), 0.75 + (index % 4) * 0.18)
+                ray_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(ray_pen)
+                painter.drawLine(start, end)
+
+        def _draw_atomic_ribbons(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+            *,
+            foreground: bool,
+        ) -> None:
+            """Draw the large broken orbital bands that define the reference."""
+
+            configs = (
+                (
+                    False,
+                    1.00,
+                    ((-0.31, -1.32), (-0.78, -1.03), (-1.02, -0.47), (-0.82, 0.06)),
+                ),
+                (
+                    False,
+                    0.88,
+                    ((0.68, -1.08), (1.08, -0.86), (1.25, -0.34), (1.04, 0.07)),
+                ),
+                (
+                    True,
+                    0.80,
+                    ((1.09, 0.39), (0.98, 0.84), (0.58, 1.19), (0.13, 1.31)),
+                ),
+                (
+                    True,
+                    0.48,
+                    ((-1.33, 0.10), (-1.06, -0.05), (-0.83, -0.05), (-0.61, 0.09)),
+                ),
+            )
+            activity = self._render_activity()
+            ribbon_activity = max(0.0, min(1.0, (activity - 0.12) / 0.72))
+            ribbon_activity = ribbon_activity * ribbon_activity * (
+                3.0 - 2.0 * ribbon_activity
+            )
+            if ribbon_activity <= 0.001:
+                return
+            energy = self._cinematic_energy()
+            primary = QColor("#319CFF")
+            cyan = QColor(_GLASS_PRIMARY)
+            hot = QColor(_GLASS_HIGHLIGHT)
+            for is_foreground, weight, coordinates in configs:
+                if is_foreground is not foreground:
+                    continue
+                points = [
+                    self._atomic_point(center, radius, coordinates_value)
+                    for coordinates_value in coordinates
+                ]
+                path = QPainterPath(points[0])
+                path.cubicTo(points[1], points[2], points[3])
+                width = radius * (0.026 + ribbon_activity * 0.014) * weight
+                bloom = QColor(primary)
+                bloom.setAlpha(round((20 + ribbon_activity * 25) * energy * ribbon_activity))
+                bloom_pen = QPen(bloom, width * 2.15)
+                bloom_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                bloom_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(bloom_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(path)
+                body = QColor(primary)
+                body.setAlpha(round((92 + ribbon_activity * 72) * energy * ribbon_activity))
+                body_pen = QPen(body, width)
+                body_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(body_pen)
+                painter.drawPath(path)
+                edge = QColor(cyan)
+                edge.setAlpha(
+                    min(255, round((146 + ribbon_activity * 64) * energy * ribbon_activity))
+                )
+                edge_pen = QPen(edge, max(1.2, width * 0.22))
+                edge_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(edge_pen)
+                painter.drawPath(path)
+                highlight = QColor(hot)
+                highlight.setAlpha(
+                    min(255, round((176 + ribbon_activity * 48) * energy * ribbon_activity))
+                )
+                painter.setPen(QPen(highlight, max(0.65, width * 0.065)))
+                painter.drawPath(path)
+
+        def _draw_atomic_core(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+        ) -> None:
+            """Paint the white-hot nucleus where the filament system converges."""
+
+            energy = self._cinematic_energy()
+            activity = self._render_activity()
+            primary = QColor(_GLASS_PRIMARY)
+            hot = QColor(_GLASS_HIGHLIGHT)
+            glow_radius = radius * (0.27 + activity * 0.035)
+            glow = QRadialGradient(center, glow_radius)
+            glow.setColorAt(0.0, QColor(255, 255, 255, min(255, round(255 * energy))))
+            glow.setColorAt(0.10, QColor(hot.red(), hot.green(), hot.blue(), min(255, round(248 * energy))))
+            glow.setColorAt(0.28, QColor(primary.red(), primary.green(), primary.blue(), round(185 * energy)))
+            glow.setColorAt(0.58, QColor(primary.red(), primary.green(), primary.blue(), round(66 * energy)))
+            glow.setColorAt(1.0, QColor(primary.red(), primary.green(), primary.blue(), 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(glow))
+            painter.drawEllipse(center, glow_radius, glow_radius)
+            nucleus = radius * (0.050 + activity * 0.008)
+            painter.setBrush(QColor(250, 255, 255, min(255, round(248 * energy))))
+            painter.drawEllipse(center, nucleus, nucleus)
+
+        def _draw_atomic_particles(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+            *,
+            foreground: bool,
+        ) -> None:
+            """Wrap the atom in several broken particle belts and loose sparks."""
+
+            if self._animation_intensity <= 0.0:
+                return
+            activity = self._render_activity()
+            energy = self._cinematic_energy()
+            primary = QColor(_GLASS_PRIMARY)
+            hot = QColor(_GLASS_HIGHLIGHT)
+            count = 158 + round(activity * 178)
+            rotations = (-6.0, 51.0, -58.0)
+            flattening = (0.20, 0.31, 0.37)
+            painter.setPen(Qt.PenStyle.NoPen)
+            for index in range(count):
+                if (index % 2 == 0) is not foreground:
+                    continue
+                belt = index % 3
+                angle = (
+                    index * 2.399963
+                    + self._phase * (0.22 + belt * 0.05) * (1 if belt != 1 else -1)
+                )
+                jitter = ((index * 47) % 53) / 52.0
+                orbit = radius * (0.91 + jitter * (0.60 + activity * 0.16))
+                local_x = math.cos(angle) * orbit
+                local_y = math.sin(angle) * orbit * flattening[belt]
+                rotation = math.radians(rotations[belt])
+                point = QPointF(
+                    center.x() + local_x * math.cos(rotation) - local_y * math.sin(rotation),
+                    center.y() + local_x * math.sin(rotation) + local_y * math.cos(rotation),
+                )
+                flicker = 0.46 + 0.54 * math.sin(self._phase * 1.7 + index * 1.31) ** 2
+                color = QColor(hot if index % 13 == 0 else primary)
+                color.setAlpha(
+                    min(255, round((45 + 124 * flicker + activity * 38) * energy))
+                )
+                painter.setBrush(color)
+                size = 0.35 + (index % 5) * 0.25 + activity * 0.18
+                painter.drawEllipse(point, size, size)
+
+            # A sparse asymmetric spray breaks the perfect orbital symmetry.
+            loose_count = 18 + round(activity * 20)
+            for index in range(loose_count):
+                if (index % 2 == 0) is not foreground:
+                    continue
+                angle = index * 2.399963 + self._phase * 0.06
+                distance = radius * (
+                    0.64 + ((index * 61) % 71) / 71.0 * (0.94 + activity * 0.18)
+                )
+                x = center.x() + math.cos(angle) * distance
+                y = center.y() + math.sin(angle) * distance * 0.86
+                if math.cos(angle) > 0.25:
+                    x += radius * activity * 0.13
+                point = QPointF(x, y)
+                color = QColor(hot if index % 9 == 0 else primary)
+                color.setAlpha(round((48 + (index % 5) * 24) * energy))
+                painter.setBrush(color)
+                size = 0.45 + (index % 4) * 0.37
+                painter.drawEllipse(point, size, size)
+
         def _cinematic_energy(self) -> float:
             """Return a truthful brightness factor for the canonical state."""
 
@@ -367,8 +922,7 @@ else:
                 return 0.56
             if self._state in {AssistantState.SUCCESS, AssistantState.COMPLETE}:
                 return 0.74
-            audio = self._audio_level if self._state in {AssistantState.LISTENING, AssistantState.SPEAKING} else 0.0
-            return min(1.22, 0.92 + audio * 0.30)
+            return min(1.22, 0.88 + self._render_activity() * 0.34)
 
         @staticmethod
         def _hot_tint(color: QColor, amount: float = 0.82) -> QColor:
@@ -384,7 +938,7 @@ else:
         def _draw_scanline(self, painter: QPainter, center: QPointF, width: float, radius: float) -> None:
             """Draw a restrained energy plane, not a full-screen HUD scan."""
 
-            primary = QColor(self._visual.primary)
+            primary = QColor(_GLASS_PRIMARY)
             y = center.y() + math.sin(self._phase * 0.42) * radius * 0.025
             left = max(0.0, center.x() - radius * 1.42)
             right = min(width, center.x() + radius * 1.42)
@@ -407,17 +961,17 @@ else:
             painter.drawLine(QPointF(left, y), QPointF(right, y))
 
         def _draw_cinematic_glow(self, painter: QPainter, center: QPointF, radius: float) -> None:
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_SECONDARY)
             energy = self._cinematic_energy()
             glow_radius = radius * 1.43
             gradient = QRadialGradient(center, glow_radius)
-            gradient.setColorAt(0.0, QColor(primary.red(), primary.green(), primary.blue(), round(11 * energy)))
-            gradient.setColorAt(0.46, QColor(primary.red(), primary.green(), primary.blue(), round(8 * energy)))
-            gradient.setColorAt(0.60, QColor(secondary.red(), secondary.green(), secondary.blue(), round(25 * energy)))
-            gradient.setColorAt(0.675, QColor(primary.red(), primary.green(), primary.blue(), round(96 * energy)))
-            gradient.setColorAt(0.715, QColor(primary.red(), primary.green(), primary.blue(), round(63 * energy)))
-            gradient.setColorAt(0.82, QColor(primary.red(), primary.green(), primary.blue(), round(18 * energy)))
+            gradient.setColorAt(0.0, QColor(primary.red(), primary.green(), primary.blue(), round(9 * energy)))
+            gradient.setColorAt(0.48, QColor(primary.red(), primary.green(), primary.blue(), round(7 * energy)))
+            gradient.setColorAt(0.62, QColor(secondary.red(), secondary.green(), secondary.blue(), round(18 * energy)))
+            gradient.setColorAt(0.69, QColor(primary.red(), primary.green(), primary.blue(), round(72 * energy)))
+            gradient.setColorAt(0.735, QColor(primary.red(), primary.green(), primary.blue(), round(49 * energy)))
+            gradient.setColorAt(0.84, QColor(primary.red(), primary.green(), primary.blue(), round(13 * energy)))
             gradient.setColorAt(1.0, QColor(primary.red(), primary.green(), primary.blue(), 0))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(gradient))
@@ -425,25 +979,35 @@ else:
 
             # Broad translucent rings fake optical bloom without blur shaders.
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            for scale, alpha, thickness in ((1.105, 24, 31.0), (1.062, 35, 18.0), (1.028, 48, 9.5)):
+            for scale, alpha, thickness in (
+                (1.095, 18, 27.0),
+                (1.052, 29, 14.0),
+                (1.020, 42, 6.0),
+            ):
                 halo = QColor(primary)
                 halo.setAlpha(round(alpha * energy))
                 painter.setPen(QPen(halo, thickness))
                 painter.drawEllipse(center, radius * scale, radius * scale)
 
         def _draw_cinematic_body(self, painter: QPainter, center: QPointF, radius: float) -> None:
-            """Build a dark translucent volume behind the electric structure."""
+            """Build the translucent, off-centre depth of an ice-glass sphere."""
 
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_DEPTH)
             energy = self._cinematic_energy()
             gradient = QRadialGradient(center, radius)
-            gradient.setColorAt(0.0, QColor(primary.red(), primary.green(), primary.blue(), round(28 * energy)))
-            gradient.setColorAt(0.12, QColor(primary.red(), primary.green(), primary.blue(), round(18 * energy)))
-            gradient.setColorAt(0.33, QColor(2, 9, 16, 10))
-            gradient.setColorAt(0.66, QColor(secondary.red(), secondary.green(), secondary.blue(), round(12 * energy)))
-            gradient.setColorAt(0.88, QColor(primary.red(), primary.green(), primary.blue(), round(31 * energy)))
-            gradient.setColorAt(0.975, QColor(primary.red(), primary.green(), primary.blue(), round(48 * energy)))
+            gradient.setFocalPoint(
+                QPointF(
+                    center.x() - radius * 0.30,
+                    center.y() - radius * 0.34,
+                )
+            )
+            gradient.setColorAt(0.0, QColor(247, 253, 255, round(48 * energy)))
+            gradient.setColorAt(0.16, QColor(primary.red(), primary.green(), primary.blue(), round(31 * energy)))
+            gradient.setColorAt(0.43, QColor(9, 35, 58, round(44 * energy)))
+            gradient.setColorAt(0.70, QColor(secondary.red(), secondary.green(), secondary.blue(), round(55 * energy)))
+            gradient.setColorAt(0.90, QColor(primary.red(), primary.green(), primary.blue(), round(61 * energy)))
+            gradient.setColorAt(0.982, QColor(200, 243, 255, round(94 * energy)))
             gradient.setColorAt(1.0, QColor(primary.red(), primary.green(), primary.blue(), 0))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(gradient))
@@ -452,10 +1016,10 @@ else:
         def _draw_hot_core(self, painter: QPainter, center: QPointF, radius: float) -> None:
             """Paint the compact hot intersection shared by the large filaments."""
 
-            primary = QColor(self._visual.primary)
+            primary = QColor(_GLASS_PRIMARY)
             hot = self._hot_tint(primary, 0.88)
             energy = self._cinematic_energy()
-            core_radius = radius * 0.285
+            core_radius = radius * 0.235
             glow = QRadialGradient(center, core_radius)
             glow.setColorAt(0.0, QColor(hot.red(), hot.green(), hot.blue(), min(255, round(255 * energy))))
             glow.setColorAt(0.08, QColor(hot.red(), hot.green(), hot.blue(), min(255, round(230 * energy))))
@@ -497,17 +1061,17 @@ else:
         def _draw_plasma_shell(self, painter: QPainter, center: QPointF, radius: float) -> None:
             """Layer bounded turbulence into a thick volumetric corona."""
 
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_SECONDARY)
             hot = self._hot_tint(primary, 0.90)
             energy = self._cinematic_energy()
             layers = (
-                (1.066, 31, 28.0, 0.047, secondary),
-                (1.044, 48, 18.0, 0.039, primary),
-                (1.026, 82, 10.5, 0.030, primary),
-                (1.012, 142, 6.4, 0.022, primary),
-                (1.002, 205, 3.1, 0.015, hot),
-                (0.996, 234, 1.25, 0.010, hot),
+                (1.050, 18, 23.0, 0.018, secondary),
+                (1.034, 32, 13.0, 0.014, primary),
+                (1.020, 57, 7.0, 0.010, primary),
+                (1.010, 104, 3.8, 0.008, primary),
+                (1.002, 188, 1.75, 0.005, hot),
+                (0.997, 224, 0.85, 0.003, hot),
             )
             for layer, (scale, alpha, thickness, jitter, color_value) in enumerate(layers):
                 path = QPainterPath()
@@ -546,7 +1110,7 @@ else:
                     center.y() + math.sin(angle) * knot_radius,
                 )
                 bloom = QColor(primary)
-                bloom.setAlpha(round(44 * energy * flicker))
+                bloom.setAlpha(round(31 * energy * flicker))
                 painter.setBrush(bloom)
                 painter.drawEllipse(point, 3.6 + flicker * 2.7, 3.6 + flicker * 2.7)
                 core = QColor(hot)
@@ -559,11 +1123,11 @@ else:
             for index in range(_CINEMATIC_SPARK_COUNT):
                 phase = self._phase * (1.55 + (index % 3) * 0.11) + index * 2.43
                 strength = max(0.0, math.sin(phase))
-                if strength < 0.54 or energy < 0.35:
+                if strength < 0.67 or energy < 0.35:
                     continue
                 angle = (index / _CINEMATIC_SPARK_COUNT) * math.tau + self._phase * 0.055
                 start_r = radius * 1.005
-                length = radius * (0.035 + 0.105 * strength)
+                length = radius * (0.024 + 0.070 * strength)
                 p1 = QPointF(center.x() + math.cos(angle) * start_r, center.y() + math.sin(angle) * start_r)
                 bend_angle = angle + math.sin(index * 1.7 + self._phase) * 0.12
                 mid_r = start_r + length * 0.54
@@ -579,8 +1143,8 @@ else:
                 discharge.lineTo(midpoint)
                 discharge.lineTo(p2)
                 glow = QColor(primary if index % 2 else secondary)
-                glow.setAlpha(round((38 + 76 * strength) * energy))
-                painter.setPen(QPen(glow, 4.2))
+                glow.setAlpha(round((25 + 52 * strength) * energy))
+                painter.setPen(QPen(glow, 3.0))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPath(discharge)
                 spark = QColor(hot)
@@ -588,11 +1152,163 @@ else:
                 painter.setPen(QPen(spark, 0.75))
                 painter.drawPath(discharge)
 
+        def _draw_glass_reflections(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+        ) -> None:
+            """Layer restrained specular highlights over the energetic interior."""
+
+            energy = self._cinematic_energy()
+            highlight = QColor(_GLASS_HIGHLIGHT)
+            primary = QColor(_GLASS_PRIMARY)
+            clip = QPainterPath()
+            clip.addEllipse(center, radius * 0.965, radius * 0.965)
+            painter.save()
+            painter.setClipPath(clip)
+
+            # A broad upper-left reflection makes the volume read as glass,
+            # with a narrow hot edge layered over the soft streak.
+            reflection = QPainterPath(
+                QPointF(center.x() - radius * 0.70, center.y() - radius * 0.23)
+            )
+            reflection.cubicTo(
+                QPointF(center.x() - radius * 0.60, center.y() - radius * 0.68),
+                QPointF(center.x() - radius * 0.16, center.y() - radius * 0.83),
+                QPointF(center.x() + radius * 0.20, center.y() - radius * 0.70),
+            )
+            soft = QColor(primary)
+            soft.setAlpha(round(20 * energy))
+            soft_pen = QPen(soft, max(7.0, radius * 0.075))
+            soft_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(soft_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(reflection)
+
+            bright = QColor(highlight)
+            bright.setAlpha(min(255, round(142 * energy)))
+            bright_pen = QPen(bright, max(1.1, radius * 0.007))
+            bright_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(bright_pen)
+            painter.drawPath(reflection)
+
+            # A low-alpha diagonal sheen gives the transparent body a second
+            # surface plane without relying on an expensive blur effect.
+            sheen = QLinearGradient(
+                center.x() - radius,
+                center.y() - radius,
+                center.x() + radius,
+                center.y() + radius,
+            )
+            clear = QColor(highlight)
+            clear.setAlpha(0)
+            milky = QColor(highlight)
+            milky.setAlpha(round(28 * energy))
+            sheen.setColorAt(0.0, clear)
+            sheen.setColorAt(0.30, milky)
+            sheen.setColorAt(0.48, clear)
+            sheen.setColorAt(1.0, clear)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(sheen))
+            painter.drawEllipse(center, radius * 0.94, radius * 0.94)
+            painter.restore()
+
+            # Broken rim highlights preserve a glass edge instead of a flat,
+            # uniformly outlined disc.
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            rim = QRectF(
+                center.x() - radius * 0.997,
+                center.y() - radius * 0.997,
+                radius * 1.994,
+                radius * 1.994,
+            )
+            rim_color = QColor(highlight)
+            rim_color.setAlpha(min(255, round(196 * energy)))
+            rim_pen = QPen(rim_color, max(1.0, radius * 0.006))
+            rim_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(rim_pen)
+            painter.drawArc(rim, 28 * 16, 104 * 16)
+            rim_color.setAlpha(min(255, round(112 * energy)))
+            painter.setPen(QPen(rim_color, max(0.8, radius * 0.004)))
+            painter.drawArc(rim, 206 * 16, 72 * 16)
+
+        def _draw_state_accent(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+        ) -> None:
+            """Keep actionable/safety states legible on the blue glass base."""
+
+            if self._state not in _SEMANTIC_ACCENT_STATES:
+                return
+            accent = QColor(self._visual.primary)
+            energy = self._cinematic_energy()
+            accent.setAlpha(min(255, round(176 * energy)))
+            pen = QPen(accent, max(1.2, radius * 0.007))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            rim = QRectF(
+                center.x() - radius * 1.014,
+                center.y() - radius * 1.014,
+                radius * 2.028,
+                radius * 2.028,
+            )
+            painter.drawArc(rim, 302 * 16, 34 * 16)
+            painter.drawArc(rim, 122 * 16, 22 * 16)
+
+        def _draw_voice_rings(
+            self,
+            painter: QPainter,
+            center: QPointF,
+            radius: float,
+        ) -> None:
+            """Open outward-facing glass arcs only when voice activity is present."""
+
+            activity = self._render_activity()
+            if activity <= 0.025 or self._reduced_motion:
+                return
+            primary = QColor(_GLASS_PRIMARY)
+            highlight = QColor(_GLASS_HIGHLIGHT)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for index, rotation in enumerate((-18.0, 56.0, 132.0)):
+                painter.save()
+                painter.translate(center)
+                painter.rotate(
+                    rotation
+                    + math.degrees(self._phase) * (0.018 if index != 1 else -0.014)
+                )
+                painter.translate(-center)
+                ring_radius = radius * (1.08 + index * 0.075)
+                rect = QRectF(
+                    center.x() - ring_radius,
+                    center.y() - ring_radius * (0.66 + index * 0.04),
+                    ring_radius * 2.0,
+                    ring_radius * (1.32 + index * 0.08),
+                )
+                glow = QColor(primary)
+                glow.setAlpha(round((18 + index * 5) * activity))
+                glow_pen = QPen(glow, 7.0 - index * 1.2)
+                glow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(glow_pen)
+                start = int((38 + index * 91 + self._phase * 4.0) * 16)
+                span = int((88 - index * 9) * 16)
+                painter.drawArc(rect, start, span)
+                thread = QColor(highlight)
+                thread.setAlpha(round((92 - index * 13) * activity))
+                thread_pen = QPen(thread, 0.85)
+                thread_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(thread_pen)
+                painter.drawArc(rect, start, span)
+                painter.restore()
+
         def _draw_internal_wisps(self, painter: QPainter, center: QPointF, radius: float) -> None:
             """Add low-alpha turbulent depth without filling the volume."""
 
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_SECONDARY)
             energy = self._cinematic_energy()
             clip = QPainterPath()
             clip.addEllipse(center, radius * 0.91, radius * 0.91)
@@ -635,7 +1351,7 @@ else:
             clip.addEllipse(center, radius * 0.93, radius * 0.93)
             painter.save()
             painter.setClipPath(clip)
-            primary = QColor(self._visual.primary)
+            primary = QColor(_GLASS_PRIMARY)
             hot = self._hot_tint(primary, 0.86)
             energy = self._cinematic_energy()
             for index, rotation in enumerate((17.0, 142.0, 258.0)):
@@ -680,8 +1396,8 @@ else:
                 ),
             )
             assert len(configs) == _CINEMATIC_TRAJECTORY_COUNT
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_SECONDARY)
             hot = self._hot_tint(primary, 0.88)
             energy = self._cinematic_energy()
             clip = QPainterPath()
@@ -734,7 +1450,7 @@ else:
             if self._visual.particles <= 0 or self._animation_intensity <= 0.0:
                 return
             count = min(18, max(1, round(self._visual.particles * 0.72 * self._animation_intensity)))
-            primary = QColor(self._visual.primary)
+            primary = QColor(_GLASS_PRIMARY)
             energy = self._cinematic_energy()
             for index in range(count):
                 angle = self._phase * (0.055 + (index % 4) * 0.012) + index * 2.399963
@@ -751,7 +1467,12 @@ else:
         def _draw_cinematic_text(self, painter: QPainter, center: QPointF, radius: float) -> None:
             title = self._overlay_title or self._state.value.upper().replace("_", " ")
             message = self._overlay_message or self._visual.label
-            painter.setPen(QColor("#EDF9FC"))
+            title_color = QColor(
+                self._visual.primary
+                if self._state in _SEMANTIC_ACCENT_STATES
+                else "#EDF9FC"
+            )
+            painter.setPen(title_color)
             font = QFont(self._font_family)
             font.setBold(True)
             font.setPointSize(max(10, int(radius * 0.043)))
@@ -783,7 +1504,7 @@ else:
                 painter.drawText(message_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, message[:96])
 
         def _draw_ambient_glow(self, painter: QPainter, center: QPointF, radius: float) -> None:
-            primary = QColor(self._visual.primary)
+            primary = QColor(_GLASS_PRIMARY)
             for multiplier, alpha in ((2.1, 12), (1.75, 18), (1.45, 26), (1.22, 34)):
                 glow = QColor(primary)
                 glow.setAlpha(int(alpha * max(0.25, self._animation_intensity)))
@@ -796,8 +1517,8 @@ else:
             count = int(self._visual.particles * self._animation_intensity)
             if count <= 0:
                 return
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_SECONDARY)
             for index in range(count):
                 ratio = (index + 1) / (count + 1)
                 angle = self._phase * (0.55 + (index % 4) * 0.08) + ratio * math.tau * 2.8
@@ -815,8 +1536,8 @@ else:
                 painter.drawEllipse(point, size, size)
 
         def _draw_orbits(self, painter: QPainter, center: QPointF, radius: float) -> None:
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_SECONDARY)
             rotations = (0.0, 48.0, -37.0)
             scales = (1.0, 1.17, 1.34)
             spans = (185.0, 126.0, 82.0)
@@ -839,16 +1560,16 @@ else:
 
         def _draw_core(self, painter: QPainter, center: QPointF, radius: float) -> None:
             gradient = QRadialGradient(center, radius)
-            core = QColor(self._visual.accent)
-            primary = QColor(self._visual.primary)
-            secondary = QColor(self._visual.secondary)
-            core.setAlpha(245)
-            primary.setAlpha(220)
-            secondary.setAlpha(135)
+            core = QColor(_GLASS_HIGHLIGHT)
+            primary = QColor(_GLASS_PRIMARY)
+            secondary = QColor(_GLASS_DEPTH)
+            core.setAlpha(238)
+            primary.setAlpha(196)
+            secondary.setAlpha(112)
             gradient.setColorAt(0.0, core)
             gradient.setColorAt(0.18, primary)
             gradient.setColorAt(0.60, secondary)
-            edge = QColor(self._visual.secondary)
+            edge = QColor(_GLASS_PRIMARY)
             edge.setAlpha(18)
             gradient.setColorAt(1.0, edge)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -865,4 +1586,11 @@ else:
             )
 
 
-__all__ = ["AsherOrbWidget", "OrbVisual", "QT_AVAILABLE", "visual_for_state"]
+__all__ = [
+    "AsherOrbWidget",
+    "OrbVisual",
+    "QT_AVAILABLE",
+    "audio_activity_for_level",
+    "cinematic_scale_for_activity",
+    "visual_for_state",
+]

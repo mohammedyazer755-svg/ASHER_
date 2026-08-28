@@ -251,6 +251,51 @@ class QtSmokeTests(unittest.TestCase):
         self.assertEqual(window.companion_mode.orb._audio_level, 0.0)
         window.close()
 
+    def test_presentation_audio_timer_directly_refreshes_both_orbs(self) -> None:
+        from dataclasses import replace
+
+        from asher.core.state import AssistantState
+        from asher.ui.window import AsherMainWindow
+
+        controller = _controller()
+        window = AsherMainWindow(controller)
+        try:
+            self.assertEqual(window._audio_timer.interval(), 66)
+            self.assertFalse(window._audio_timer.isActive())
+            listening = replace(
+                controller.status(),
+                state=AssistantState.LISTENING,
+                microphone_active=True,
+                microphone_level=0.42,
+            )
+            with patch.object(controller, "status", return_value=listening):
+                window._refresh_status()
+                self.assertTrue(window._audio_timer.isActive())
+                window._refresh_orb_audio()
+
+            self.assertAlmostEqual(window.home.orb._audio_level, 0.42)
+            self.assertAlmostEqual(window.companion_mode.orb._audio_level, 0.42)
+
+            inactive = replace(
+                listening,
+                microphone_active=False,
+                microphone_level=0.42,
+            )
+            with patch.object(controller, "status", return_value=inactive):
+                window._refresh_orb_audio()
+            self.assertFalse(window._audio_timer.isActive())
+            self.assertEqual(window.home.orb._audio_level, 0.0)
+            self.assertEqual(window.companion_mode.orb._audio_level, 0.0)
+
+            window._audio_poll_enabled = True
+            window._sync_audio_timer()
+            with patch.object(controller, "status", side_effect=RuntimeError("offline")):
+                window._refresh_orb_audio()
+            self.assertFalse(window._audio_poll_enabled)
+            self.assertFalse(window._audio_timer.isActive())
+        finally:
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main()
