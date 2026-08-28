@@ -86,7 +86,7 @@ class AsherConfig:
     confirmation_seconds: int = 90
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_local: bool = True
-    ollama_model: str = "qwen3:4b"
+    ollama_model: str = "qwen3.5:9b"
     openai_routine_model: str = "gpt-5.6-luna"
     openai_reasoning_model: str = "gpt-5.6-terra"
     openai_transcribe_model: str = "gpt-4o-transcribe"
@@ -125,7 +125,7 @@ class AsherConfig:
             confirmation_seconds=_integer("ASHER_CONFIRMATION_SECONDS", 90, 15, 600),
             ollama_url=ollama_url,
             ollama_local=ollama_local,
-            ollama_model=os.getenv("ASHER_OLLAMA_MODEL", "qwen3:4b").strip(),
+            ollama_model=os.getenv("ASHER_OLLAMA_MODEL", "qwen3.5:9b").strip(),
             openai_routine_model=os.getenv("ASHER_OPENAI_ROUTINE_MODEL", "gpt-5.6-luna").strip(),
             openai_reasoning_model=os.getenv("ASHER_OPENAI_REASONING_MODEL", "gpt-5.6-terra").strip(),
             openai_transcribe_model=os.getenv("ASHER_OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip(),

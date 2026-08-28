@@ -119,6 +119,28 @@ class QtSmokeTests(unittest.TestCase):
         self.assertEqual(window.stack.currentWidget(), window.memory_page)
         window.close()
 
+
+    def test_local_provider_is_not_presented_as_no_connectivity(self) -> None:
+        from dataclasses import replace
+
+        from asher.ui.window import AsherMainWindow
+
+        controller = _controller()
+        window = AsherMainWindow(controller)
+        window.show()
+        self.app.processEvents()
+
+        local_status = replace(controller.status(), offline=True, api_configured=False)
+        with patch.object(controller, "status", return_value=local_status):
+            window._refresh_status()
+        self.app.processEvents()
+
+        self.assertEqual(window.header_offline.text(), "LOCAL MODE")
+        self.assertIn("local", window.home.provider.text().casefold())
+        self.assertNotIn("offline", window.home.provider.text().casefold())
+        self.assertEqual(window.companion_mode.presence.text(), "LOCAL")
+        window.close()
+
     def test_memory_export_uses_workspace_save_dialog_and_stays_out_of_companion(self) -> None:
         from PySide6.QtWidgets import QPushButton
 

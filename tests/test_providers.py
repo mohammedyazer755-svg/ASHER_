@@ -67,6 +67,96 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("session", client.responses.kwargs["input"])
         self.assertNotIn("should-not-leak", client.responses.kwargs["input"])
 
+
+    def test_qwen35_9b_is_the_default_local_model_and_timeout_allows_cold_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {}, clear=True):
+                config = AsherConfig.load(directory)
+        self.assertEqual(config.ollama_model, "qwen3.5:9b")
+        provider = OllamaProvider()
+        self.assertEqual(provider.model, "qwen3.5:9b")
+        self.assertGreaterEqual(provider.timeout, 60.0)
+
+    def test_ollama_planner_disables_long_thinking_for_strict_schema_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = AsherConfig.load(directory)
+            registry = build_registry(config, Database(Path(directory) / "db.sqlite"))
+            provider = OllamaProvider(model="qwen3.5:9b")
+            captured = {}
+
+            def fake_urlopen(request, timeout):
+                captured["body"] = json.loads(request.data.decode("utf-8"))
+                captured["timeout"] = timeout
+                return _HTTPResponse(
+                    {"message": {"content": json.dumps({"goal": "answer", "response": "Ready", "steps": []})}}
+                )
+
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                result = provider.plan("hello", context={}, tool_schemas=[], registry=registry)
+
+        self.assertEqual(result.response, "Ready")
+        self.assertFalse(captured["body"]["think"])
+        self.assertEqual(captured["body"]["options"]["num_ctx"], 8192)
+        self.assertGreaterEqual(captured["timeout"], 60.0)
+
+
+    def test_ollama_conversation_collapses_harmless_no_tool_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = AsherConfig.load(directory)
+            registry = build_registry(config, Database(Path(directory) / "db.sqlite"))
+            provider = OllamaProvider(model="qwen3.5:9b")
+            payload = {
+                "goal": "explain AI agents",
+                "response": "An AI agent is software that can reason about a goal and take actions toward it.",
+                "steps": [
+                    {
+                        "id": "answer",
+                        "tool": "none",
+                        "arguments": {},
+                        "description": "No tool is required",
+                        "depends_on": [],
+                    }
+                ],
+            }
+            with patch(
+                "urllib.request.urlopen",
+                return_value=_HTTPResponse({"message": {"content": json.dumps(payload)}}),
+            ):
+                result = provider.plan(
+                    "Explain what an AI agent is in one sentence.",
+                    context={},
+                    tool_schemas=[],
+                    registry=registry,
+                )
+
+        self.assertEqual(result.steps, ())
+        self.assertIn("AI agent", result.response)
+
+    def test_ollama_unknown_real_tool_still_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = AsherConfig.load(directory)
+            registry = build_registry(config, Database(Path(directory) / "db.sqlite"))
+            provider = OllamaProvider(model="qwen3.5:9b")
+            payload = {
+                "goal": "do something",
+                "response": "Trying.",
+                "steps": [
+                    {
+                        "id": "bad",
+                        "tool": "definitely.not.a.real.tool",
+                        "arguments": {},
+                        "description": "Invalid tool",
+                        "depends_on": [],
+                    }
+                ],
+            }
+            with patch(
+                "urllib.request.urlopen",
+                return_value=_HTTPResponse({"message": {"content": json.dumps(payload)}}),
+            ):
+                with self.assertRaises(ProviderError):
+                    provider.plan("Do something.", context={}, tool_schemas=[], registry=registry)
+
     def test_ollama_invalid_structured_output_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = AsherConfig.load(directory)

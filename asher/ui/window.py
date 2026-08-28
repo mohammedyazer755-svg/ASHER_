@@ -297,7 +297,7 @@ else:
             self.listen_button.setText("Stop listening" if status.microphone_active else "Start listening")
             self.mic.setText("MIC · active" if status.microphone_active else "MIC · standby")
             if status.offline:
-                self.provider.setText("PROVIDER · local / offline")
+                self.provider.setText("PROVIDER · local · Qwen")
             elif status.api_configured:
                 self.provider.setText("PROVIDER · local + API")
             else:
@@ -445,7 +445,7 @@ else:
             self.state.setText(state_text)
             self.message.setText(message)
             self.orb.set_overlay_text(state_text, message)
-            self.presence.setText("OFFLINE" if status.offline else "LOCAL")
+            self.presence.setText("LOCAL" if status.offline else "LOCAL + API")
             if status.emergency_stopped:
                 self.presence.setText("STOPPED")
 
@@ -1059,7 +1059,7 @@ else:
             self.header_state.setText(state_text)
             self.header_state.setStyleSheet("color: #ffb4b4;" if status.state == AssistantState.ERROR else "")
             self.header_message.setText(status.message)
-            self.header_offline.setText("OFFLINE MODE" if status.offline else "LOCAL + API")
+            self.header_offline.setText("LOCAL MODE" if status.offline else "LOCAL + API")
             self.header_api.setText("API configured" if status.api_configured else "API not configured")
             self.header_session.setText(
                 "SESSION ACTIVE" if status.owner_session_active else "SESSION EXPIRED"

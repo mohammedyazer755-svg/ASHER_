@@ -33,7 +33,10 @@ invent tools, expose secrets, or claim that a tool succeeded. Preserve contact
 names and message text. Use the smallest ordered plan. Consequential tools
 must remain separate steps so the local policy layer can preview and confirm.
 Give every step a unique short id and let depends_on reference only earlier
-step ids. Use only the minimal context supplied by the application.
+step ids. For a request that only needs a conversational answer, put the
+complete answer in response and set steps to an empty array. Never invent a
+placeholder tool such as none, no_tool, null, or n/a. Use only the minimal
+context supplied by the application.
 """.strip()
 
 
@@ -87,14 +90,50 @@ class OpenAIResponsesProvider:
             raise ProviderError(f"OpenAI planner failed: {type(error).__name__}") from error
 
 
+
+_NO_TOOL_SENTINELS = {"none", "no_tool", "no-tool", "null", "n/a"}
+
+
+def _normalize_local_no_tool_response(payload: Any) -> Any:
+    """Collapse one harmless local-model no-tool placeholder into no steps.
+
+    The strict validator remains authoritative for every real tool call. This
+    adapter only handles the common structured-output mistake where a local
+    model emits a single `tool: none` placeholder for a pure conversation.
+    """
+
+    if not isinstance(payload, dict):
+        return payload
+    response = payload.get("response")
+    raw_steps = payload.get("steps")
+    if not isinstance(response, str) or not response.strip():
+        return payload
+    if not isinstance(raw_steps, list) or len(raw_steps) != 1:
+        return payload
+    step = raw_steps[0]
+    if not isinstance(step, dict):
+        return payload
+    name = step.get("tool") or step.get("name")
+    if not isinstance(name, str) or name.strip().casefold() not in _NO_TOOL_SENTINELS:
+        return payload
+    if step.get("arguments", {}) != {}:
+        return payload
+    if step.get("depends_on", []) != []:
+        return payload
+
+    normalized = dict(payload)
+    normalized["steps"] = []
+    return normalized
+
+
 class OllamaProvider:
     name = "ollama"
 
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:11434",
-        model: str = "qwen3:4b",
-        timeout: float = 20.0,
+        model: str = "qwen3.5:9b",
+        timeout: float = 60.0,
         *,
         offline: bool | None = None,
     ) -> None:
@@ -113,7 +152,11 @@ class OllamaProvider:
             ],
             "format": PLAN_JSON_SCHEMA,
             "stream": False,
-            "options": {"temperature": 0, "num_predict": 700},
+            # Qwen3.5 supports a thinking channel. Planning here already uses a
+            # strict local schema, so disable long hidden reasoning for the
+            # routine planner path to keep voice/text latency predictable.
+            "think": False,
+            "options": {"temperature": 0, "num_predict": 700, "num_ctx": 8192},
         }
         request = urllib.request.Request(
             f"{self.base_url}/api/chat",
@@ -127,7 +170,8 @@ class OllamaProvider:
             content = payload.get("message", {}).get("content", "")
             if not content:
                 raise ProviderError("Ollama returned no message content")
-            return validate_plan_payload(json.loads(content), registry, provider=self.name, offline=True)
+            parsed = _normalize_local_no_tool_response(json.loads(content))
+            return validate_plan_payload(parsed, registry, provider=self.name, offline=True)
         except ProviderError:
             raise
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
@@ -178,7 +222,7 @@ class HybridPlanner:
         self.offline = True
         return ProposedPlan(
             goal=command,
-            response="I’m offline or the configured planner is unavailable. I can still handle supported local commands, but I won’t guess at this request.",
+            response="The configured planner is unavailable. I can still handle supported local commands, but I won’t guess at this request.",
             provider="fallback",
             offline=True,
         )
