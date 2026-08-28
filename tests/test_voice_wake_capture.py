@@ -23,7 +23,7 @@ from asher.voice.wakeword import (
     TextWakeDetector,
     match_wake_phrase,
 )
-from asher.voice.runtime import VoiceRuntime, normalized_pcm16_rms
+from asher.voice.runtime import COMMAND_TURN_VAD, VoiceRuntime, normalized_pcm16_rms
 from asher.voice.types import TranscriptResult
 
 
@@ -192,6 +192,43 @@ class WakeCaptureTests(unittest.TestCase):
         self.assertFalse(result.speech_started)
         self.assertEqual(result.pcm16, b"")
 
+    def test_runtime_command_capture_survives_natural_pause_and_keeps_pre_roll(self) -> None:
+        class QuietTTS:
+            @staticmethod
+            def stop() -> int:
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = SimpleNamespace(config=AsherConfig.load(directory))
+            runtime = VoiceRuntime(
+                controller,
+                transcriber=object(),
+                tts=QuietTTS(),
+            )
+            frames = iter(
+                [AudioFrame(pcm(0.001)) for _ in range(6)]
+                + [AudioFrame(pcm(0.22)) for _ in range(4)]
+                # 600 ms pause: longer than the old 550 ms endpoint, but
+                # intentionally shorter than VOICE-2C command endpointing.
+                + [AudioFrame(pcm(0.001)) for _ in range(30)]
+                + [AudioFrame(pcm(0.31)) for _ in range(4)]
+                + [AudioFrame(pcm(0.001)) for _ in range(COMMAND_TURN_VAD.end_silence_frames)]
+                + [AudioFrame(pcm(0.45)) for _ in range(3)]
+            )
+
+            turn = runtime._capture_trigger(
+                frames,
+                vad_config=COMMAND_TURN_VAD,
+            )
+
+        self.assertIsNotNone(turn)
+        assert turn is not None
+        self.assertTrue(turn.speech_started)
+        self.assertTrue(turn.ended_on_silence)
+        self.assertIn(pcm(0.22), turn.pcm16)
+        self.assertIn(pcm(0.31), turn.pcm16)
+        self.assertNotIn(pcm(0.45), turn.pcm16)
+
     def test_standalone_wake_keeps_next_utterance_active_and_speaks_reply(self) -> None:
         transcripts = iter(("hey asher", "open chrome"))
 
@@ -250,7 +287,8 @@ class WakeCaptureTests(unittest.TestCase):
                 ]
                 super().__init__(*args, **kwargs)
 
-            def _capture_trigger(self, _frames, *, deadline=None):
+            def _capture_trigger(self, _frames, *, deadline=None, vad_config=None):
+                del deadline, vad_config
                 if self.turns:
                     return self.turns.pop(0)
                 self.stop()
@@ -273,8 +311,10 @@ class WakeCaptureTests(unittest.TestCase):
         self.assertEqual([item[0] for item in controller.commands], ["open chrome"])
         self.assertIn("Yes?", tts.spoken)
         self.assertIn("Opening Chrome in dry-run mode.", tts.spoken)
-        self.assertIn("listening", {event.kind for event in events})
-        self.assertIn("reply", {event.kind for event in events})
+        kinds = [event.kind for event in events]
+        self.assertEqual(kinds.count("transcript"), 1)
+        self.assertIn("listening", set(kinds))
+        self.assertIn("reply", set(kinds))
 
 
 if __name__ == "__main__":

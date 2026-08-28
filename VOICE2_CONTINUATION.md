@@ -178,3 +178,52 @@ VOICE-2 work currently modified after the VOICE-2A checkpoint:
 ## 17. CURRENT GIT COMMIT HASH
 
 `de076cba6f4d712669eb6e81c55b511185463039`
+
+
+---
+
+## VOICE-2C ? FULL-TURN CAPTURE ? COMPLETE
+
+Status: COMPLETE / WINDOWS VERIFIED
+
+Implemented:
+- Dedicated wake audio is activation-only and is not reused as command audio.
+- After wake, ASHER captures a separate complete command turn.
+- Command capture keeps bounded pre-roll so initial speech is less likely to be clipped.
+- Endpoint silence allows more natural pauses before ending the utterance.
+- If the user has started speaking near the listening deadline, the active utterance is allowed to finish.
+- Rejected/standby wake audio does not pollute permanent Conversation history.
+- Permanent history receives the accepted canonical user command rather than unstable wake/transcription fragments.
+
+Windows verification:
+- Full suite: 217 tests passed, 0 failed.
+- Deterministic legacy voice smoke: PASS.
+- run_tests.ps1: PASS.
+
+Current architecture:
+standby audio
+-> wake boundary
+-> wake accepted
+-> fresh command capture
+-> VAD/end-of-turn
+-> one final transcript
+-> normal controller/text path
+-> Qwen/tools
+-> TTS
+
+Next milestone:
+VOICE-2D ? STT QUALITY
+
+Next action:
+Audit the active Faster-Whisper model and decoding configuration.
+Benchmark the CURRENT STT configuration against one stronger realistic local candidate.
+Do not replace the model blindly.
+
+Measure:
+- transcript accuracy on the same spoken phrases
+- speech-end -> final transcript latency
+- GPU/VRAM practicality
+- command/name accuracy, especially "Asher"
+- coexistence with qwen3.5:9b
+
+Do not redo VOICE-2A, VOICE-2B or VOICE-2C.

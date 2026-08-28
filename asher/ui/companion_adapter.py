@@ -283,8 +283,13 @@ class CompanionDesktopController:
             message = redact_text(getattr(event, "message", ""))
             self._message = message or self._message
             transcript = getattr(event, "transcript", None)
-            if getattr(event, "kind", "") == "transcript" and transcript is not None:
-                text = redact_text(getattr(transcript, "normalized_text", "")).strip()
+            if getattr(event, "kind", "") == "transcript":
+                # VoiceRuntime emits this event only for one accepted final
+                # command. Prefer its canonical post-wake/post-normalization
+                # message so a decoded wake prefix never pollutes history.
+                text = redact_text(getattr(event, "message", "")).strip()
+                if not text and transcript is not None:
+                    text = redact_text(getattr(transcript, "normalized_text", "")).strip()
                 if text:
                     self._conversation.append(ConversationTurn("You", text))
             reply = getattr(event, "reply", None)

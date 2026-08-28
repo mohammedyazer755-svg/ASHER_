@@ -16,6 +16,8 @@ from asher.security.strong_auth import StrongAuthResult
 from asher.types import AuthMethod, RiskLevel, Role
 from asher.ui.companion_adapter import CompanionDesktopController
 from asher.ui.controller import PendingAction
+from asher.voice.runtime import VoiceRuntimeEvent
+from asher.voice.types import TranscriptResult
 
 
 class _Denied:
@@ -54,6 +56,44 @@ class UIAdapterTests(unittest.TestCase):
             controller,
             strong_authenticator=_Verified() if verified else _Denied(),
         )
+
+    def test_voice_history_persists_only_canonical_final_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = self._adapter(directory, verified=True)
+            rejected = TranscriptResult(
+                raw_text="hey usher maybe",
+                normalized_text="hey usher maybe",
+                acoustic_confidence=0.41,
+                no_speech_probability=0.01,
+            )
+            adapter._on_voice_event(
+                VoiceRuntimeEvent(
+                    "wake_rejected",
+                    "Wake phrase not detected",
+                    rejected,
+                )
+            )
+            self.assertEqual(adapter.conversation(), ())
+
+            accepted = TranscriptResult(
+                raw_text="hey asher open chrome",
+                normalized_text="hey asher open chrome",
+                acoustic_confidence=0.95,
+                no_speech_probability=0.01,
+            )
+            adapter._on_voice_event(
+                VoiceRuntimeEvent(
+                    "transcript",
+                    "open chrome",
+                    accepted,
+                )
+            )
+
+            turns = adapter.conversation()
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0].sender, "You")
+            self.assertEqual(turns[0].message, "open chrome")
+            adapter.close()
 
     def test_ui_uses_real_controller_and_persists_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

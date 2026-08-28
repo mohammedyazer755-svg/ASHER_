@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,12 +22,23 @@ from asher.agent.controller import CompanionController, CompanionReply
 from asher.config import AsherConfig
 from asher.core.cancellation import CancellationToken, CancelledError
 from asher.core.state import AssistantState, StateStore
-from asher.voice.capture import AudioFrame, TurnCapture, VadConfig
+from asher.voice.capture import AudioFrame, TurnCapture, VadConfig, VoiceActivityDetector
 from asher.voice.pipeline import PipelineStatus, VoiceAccuracyPipeline
 from asher.voice.transcription import FasterWhisperTranscriber, TranscriptionConfig
 from asher.voice.types import TranscriptResult
 from asher.voice.vocabulary import DynamicVocabulary
 from asher.voice.wakeword import EnergyGate, TextWakeDetector
+
+
+# VOICE-2C keeps wake and command capture as distinct acoustic turns.  The
+# command endpoint is intentionally more tolerant than the standby/wake turn so
+# ordinary sentence pauses do not split one request into multiple commands.
+WAKE_TURN_VAD = VadConfig()
+COMMAND_TURN_VAD = VadConfig(
+    end_silence_ms=900,
+    pre_roll_ms=240,
+    max_turn_ms=15_000,
+)
 
 
 SLEEP_COMMANDS = frozenset(
@@ -737,6 +749,8 @@ class VoiceRuntime:
         self._microphone_level_lock = threading.Lock()
         self._microphone_level = 0.0
         self._wake_fallback_announced = False
+        self._wake_turn_vad = WAKE_TURN_VAD
+        self._command_turn_vad = COMMAND_TURN_VAD
 
     @property
     def microphone_level(self) -> float:
@@ -801,6 +815,7 @@ class VoiceRuntime:
                 turn = self._capture_trigger(
                     frames,
                     deadline=active_until if active else None,
+                    vad_config=self._command_turn_vad if active else self._wake_turn_vad,
                 )
                 if turn is None:
                     if active and not self._stop.cancelled:
@@ -811,6 +826,9 @@ class VoiceRuntime:
                     continue
                 if not turn.pcm16:
                     continue
+
+                result = None
+                command = ""
                 if active_session is None:
                     binding = (
                         self._wake_word_binding_override
@@ -828,44 +846,58 @@ class VoiceRuntime:
                                 confidence=wake_score,
                             )
                             continue
+
+                        # A trained acoustic wake turn is activation audio only.
+                        # Never re-use or decode that buffer as the command: the
+                        # next VAD turn is captured independently, which prevents
+                        # a mis-decoded wake prefix from leaking into the request.
                         self._accept_wake(
                             "Hey Asher detected by the trained acoustic wake model",
                             confidence=wake_score,
                         )
                         active_session = self._authenticate_speaker(turn)
                         active_until = self._clock() + self.active_window_seconds
-                        result = self._transcribe_turn(turn)
-                    else:
-                        fallback_allowed, fallback_score, fallback_reason = binding.verify(
-                            turn.pcm16,
-                            turn.sample_rate,
+                        self._transition(AssistantState.LISTENING, "Listening for your command")
+                        self._emit("listening", "Yes?")
+                        self._speak("Yes?", return_state=AssistantState.LISTENING)
+                        continue
+
+                    # No personalized acoustic artifact exists yet. This is the
+                    # explicitly degraded transcript-only wake fallback.
+                    fallback_allowed, fallback_score, fallback_reason = binding.verify(
+                        turn.pcm16,
+                        turn.sample_rate,
+                    )
+                    if not fallback_allowed:
+                        self._reject_wake(
+                            fallback_reason,
+                            confidence=fallback_score,
                         )
-                        if not fallback_allowed:
-                            self._reject_wake(
-                                fallback_reason,
-                                confidence=fallback_score,
-                            )
-                            continue
-                        self._announce_wake_fallback()
-                        result = self._transcribe_turn(turn)
-                else:
+                        continue
+                    self._announce_wake_fallback()
                     result = self._transcribe_turn(turn)
-
-                self._emit("transcript", result.clarification or result.executable_command or "", result.transcript, confidence=result.transcript.acoustic_confidence)
-                if result.status is not PipelineStatus.ACCEPTED:
-                    self._emit("clarification", result.clarification or "Please repeat that.", result.transcript)
-                    if active_session is not None:
-                        self._speak(result.clarification or "Please repeat that.")
-                        active_until = self._clock() + self.active_window_seconds
-                    continue
-
-                heard = result.executable_command or ""
-                wake = self.wake_detector.detect(heard)
-                if active_session is None:
-                    # This is the explicitly degraded path used only when the
-                    # registry proves no trained acoustic wake artifact exists.
+                    if result.status is not PipelineStatus.ACCEPTED:
+                        # Standby noise / failed wake candidates are diagnostic
+                        # only. They are not user conversation and must never be
+                        # persisted as a final transcript.
+                        self._transition(AssistantState.STANDBY, "Wake phrase not detected")
+                        self._emit(
+                            "wake_fallback_rejected",
+                            result.clarification or "Wake phrase not detected",
+                            result.transcript,
+                            confidence=result.transcript.acoustic_confidence,
+                        )
+                        continue
+                    heard = result.executable_command or ""
+                    wake = self.wake_detector.detect(heard)
                     if not wake.detected:
                         self._transition(AssistantState.STANDBY, "Wake phrase not detected")
+                        self._emit(
+                            "wake_rejected",
+                            "Wake phrase not detected by transcript fallback",
+                            result.transcript,
+                            confidence=wake.score,
+                        )
                         continue
                     self._accept_wake(
                         "Hey Asher detected by transcript-only fallback",
@@ -878,17 +910,45 @@ class VoiceRuntime:
                     )
                     active_until = self._clock() + self.active_window_seconds
                     command = wake.command
+                    if not command:
+                        self._transition(AssistantState.LISTENING, "Listening for your command")
+                        self._emit("listening", "Yes?", result.transcript)
+                        self._speak("Yes?", return_state=AssistantState.LISTENING)
+                        continue
                 else:
-                    # A trained acoustic wake already authorized activation, so
-                    # text matching is useful only for stripping a correctly
-                    # decoded prefix. It is never a second acceptance gate.
+                    result = self._transcribe_turn(turn)
+                    if result.status is not PipelineStatus.ACCEPTED:
+                        self._emit(
+                            "clarification",
+                            result.clarification or "Please repeat that.",
+                            result.transcript,
+                        )
+                        self._speak(result.clarification or "Please repeat that.")
+                        active_until = self._clock() + self.active_window_seconds
+                        continue
+                    heard = result.executable_command or ""
+                    wake = self.wake_detector.detect(heard)
+                    # Repeating the wake phrase inside an already-active session
+                    # is harmless; strip it if Whisper decoded it correctly.
                     command = wake.command if wake.detected else heard
 
+                assert result is not None
+                command = command.strip()
                 if not command:
                     self._transition(AssistantState.LISTENING, "Listening for your command")
-                    self._emit("listening", "Yes?", result.transcript)
-                    self._speak("Yes?", return_state=AssistantState.LISTENING)
                     continue
+
+                # This is the only permanent final-user-transcript event.  Wake
+                # candidates, rejected standby audio and low-confidence turns do
+                # not use this event kind.  The event message is the canonical
+                # command after wake-prefix removal/entity normalization.
+                self._emit(
+                    "transcript",
+                    command,
+                    result.transcript,
+                    confidence=result.transcript.acoustic_confidence,
+                )
+
                 if command.casefold().strip().rstrip(".,!?;:") in SLEEP_COMMANDS:
                     active_session = None
                     active_until = 0.0
@@ -1014,8 +1074,22 @@ class VoiceRuntime:
         )
         return session
 
-    def _capture_trigger(self, frames: Any, *, deadline: float | None = None):
-        # Skip silence cheaply, then let VAD collect a complete turn.
+    def _capture_trigger(
+        self,
+        frames: Any,
+        *,
+        deadline: float | None = None,
+        vad_config: VadConfig | None = None,
+    ):
+        """Capture one VAD-bounded turn while preserving pre-trigger audio.
+
+        The deadline applies only while waiting for speech to start. Once a
+        user has started a turn, let endpointing finish it instead of truncating
+        a sentence because the active-listening window expired mid-utterance.
+        """
+
+        config = vad_config or WAKE_TURN_VAD
+        pre_roll: deque[AudioFrame] = deque(maxlen=config.pre_roll_frames)
         while not self._stop.cancelled:
             if deadline is not None and self._clock() >= deadline:
                 self._reset_microphone_level()
@@ -1031,7 +1105,9 @@ class VoiceRuntime:
                 speech_detected=speech_detected,
             )
             if not speech_detected:
+                pre_roll.append(frame)
                 continue
+
             # A detected user turn is a barge-in signal. Providers are
             # interruptible; stopping here keeps speech from blocking the next
             # command or an emergency request.
@@ -1039,14 +1115,22 @@ class VoiceRuntime:
                 self.tts.stop()
             except Exception:
                 pass
-            capture = TurnCapture()
+
+            vad = VoiceActivityDetector(config)
+            if pre_roll:
+                # Calibrate only from frames that the cheap standby energy gate
+                # already classified as non-speech. This gives TurnCapture a
+                # local noise-floor estimate without retaining raw audio.
+                vad.calibrate(tuple(pre_roll))
+            capture = TurnCapture(vad)
+            buffered = tuple(pre_roll)
+            pre_roll.clear()
 
             def remaining_frames():
+                yield from buffered
                 yield frame
-                for _ in range(capture.config.max_turn_frames - 1):
+                for _ in range(capture.config.max_turn_frames - len(buffered) - 1):
                     if self._stop.cancelled:
-                        return
-                    if deadline is not None and self._clock() >= deadline:
                         return
                     try:
                         next_frame = next(frames)

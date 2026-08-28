@@ -61,12 +61,15 @@ class _FakeTTS:
 
 
 class _ScriptedRuntime(VoiceRuntime):
-    def __init__(self, *args, **kwargs) -> None:
-        self.turns = [CapturedTurn(b"\x01\x00" * 320, 16_000, 1, True, True)]
+    def __init__(self, *args, scripted_turns=None, **kwargs) -> None:
+        self.turns = list(
+            scripted_turns
+            or [CapturedTurn(b"\x01\x00" * 320, 16_000, 1, True, True)]
+        )
         super().__init__(*args, **kwargs)
 
-    def _capture_trigger(self, _frames, *, deadline=None):
-        del deadline
+    def _capture_trigger(self, _frames, *, deadline=None, vad_config=None):
+        del deadline, vad_config
         if self.turns:
             return self.turns.pop(0)
         self.stop()
@@ -78,6 +81,8 @@ def _run_one_turn(
     transcript: str,
     binding: WakeWordModelBinding,
     speaker: _SpeakerVerifier,
+    *,
+    turn_count: int = 1,
 ):
     actor = SimpleNamespace(user_id="owner-id", role=SimpleNamespace(value="owner"))
 
@@ -125,6 +130,10 @@ def _run_one_turn(
     controller = Controller()
     events = []
     transcriber = Transcriber()
+    scripted_turns = [
+        CapturedTurn(bytes([index + 1, 0]) * 320, 16_000, 1, True, True)
+        for index in range(turn_count)
+    ]
     runtime = _ScriptedRuntime(
         controller,
         backend=Backend(),
@@ -133,6 +142,7 @@ def _run_one_turn(
         voiceguard=speaker,
         tts=_FakeTTS(),
         on_event=events.append,
+        scripted_turns=scripted_turns,
     )
     runtime.run_forever()
     controller.transcriber_calls = transcriber.calls
@@ -173,6 +183,7 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
                 "open chrome",
                 WakeWordModelBinding(True, verifier=wake),
                 speaker,
+                turn_count=2,
             )
 
         self.assertEqual(wake.calls, 1)
@@ -183,6 +194,7 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
             ["open chrome"],
         )
         kinds = [event.kind for event in events]
+        self.assertEqual(kinds.count("transcript"), 1)
         self.assertLess(kinds.index("wake_detected"), kinds.index("authenticated"))
         self.assertLess(kinds.index("authenticated"), kinds.index("transcribing"))
 
@@ -195,6 +207,7 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
                 "hey asher open chrome",
                 WakeWordModelBinding(True, verifier=wake),
                 speaker,
+                turn_count=2,
             )
 
         self.assertEqual(wake.calls, 1)
