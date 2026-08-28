@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import gc
+import os
 import sys
 import math
 import threading
@@ -46,7 +47,7 @@ DEFAULT_VAD_PARAMETERS: dict[str, Any] = {
 class TranscriptionConfig:
     model_size: str = "distil-large-v3"
     device: str = "auto"
-    cuda_compute_type: str = "float16"
+    cuda_compute_type: str = "int8_float16"
     cpu_compute_type: str = "int8"
     allow_cpu_fallback: bool = True
     language: str | None = "en"
@@ -82,6 +83,69 @@ ModelFactory = Callable[..., Any]
 CudaProbe = Callable[[], bool]
 
 
+_WINDOWS_CUDA_DLL_HANDLES: list[Any] = []
+_WINDOWS_CUDA_DLL_PATHS: set[str] = set()
+
+
+def _bundled_cuda_dll_directories(site_packages: str | Path) -> tuple[Path, ...]:
+    """Return venv-local CUDA runtime directories that contain required DLLs.
+
+    The NVIDIA Windows wheels install cuBLAS/cuDNN beneath ``site-packages/nvidia``.
+    CTranslate2 loads these libraries lazily when the first CUDA inference actually
+    runs, so successful model construction alone does not prove the runtime DLLs
+    are discoverable.
+    """
+
+    root = Path(site_packages)
+    candidates = (
+        (root / "nvidia" / "cublas" / "bin", "cublas64_12.dll"),
+        (root / "nvidia" / "cudnn" / "bin", "cudnn64_9.dll"),
+    )
+    return tuple(directory for directory, dll in candidates if (directory / dll).is_file())
+
+
+def _prepare_windows_cuda_runtime() -> tuple[str, ...]:
+    """Expose venv-local CUDA DLLs to this ASHER process only.
+
+    No global Windows PATH or CUDA installation is modified.  Python's DLL search
+    path and the child-process PATH are extended lazily immediately before local
+    CUDA speech probing/model use.
+    """
+
+    if os.name != "nt":
+        return ()
+
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+    directories = _bundled_cuda_dll_directories(site_packages)
+    if not directories:
+        return ()
+
+    resolved: list[str] = []
+    for directory in directories:
+        value = str(directory.resolve())
+        resolved.append(value)
+        if value in _WINDOWS_CUDA_DLL_PATHS:
+            continue
+
+        add_directory = getattr(os, "add_dll_directory", None)
+        if callable(add_directory):
+            try:
+                # Keep the returned handles alive for the process lifetime. Closing
+                # them removes the directory from Python's DLL search path.
+                _WINDOWS_CUDA_DLL_HANDLES.append(add_directory(value))
+            except OSError:
+                # PATH below is still useful for CTranslate2's lazy runtime loader.
+                pass
+        _WINDOWS_CUDA_DLL_PATHS.add(value)
+
+    existing = [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
+    existing_folded = {item.casefold() for item in existing}
+    prepend = [item for item in resolved if item.casefold() not in existing_folded]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join((*prepend, *existing))
+    return tuple(resolved)
+
+
 def _default_cuda_probe() -> bool:
     """Check CUDA lazily, preferring CTranslate2 over importing Torch."""
 
@@ -90,6 +154,7 @@ def _default_cuda_probe() -> bool:
     # can still inject ``cuda_probe`` explicitly.
     if importlib.util.find_spec("faster_whisper") is None:
         return False
+    _prepare_windows_cuda_runtime()
     try:
         ctranslate2 = importlib.import_module("ctranslate2")
         count_fn = getattr(ctranslate2, "get_cuda_device_count", None)
@@ -105,6 +170,8 @@ def _default_cuda_probe() -> bool:
 
 
 def _default_model_factory(model_size: str, **kwargs: Any) -> Any:
+    if str(kwargs.get("device", "")).casefold() == "cuda":
+        _prepare_windows_cuda_runtime()
     try:
         module = importlib.import_module("faster_whisper")
     except (ImportError, ModuleNotFoundError) as error:

@@ -5,7 +5,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from asher.config import AsherConfig
 from asher.voice.evaluation import (
     VoicePrediction,
     evaluate_predictions,
@@ -19,6 +21,7 @@ from asher.voice.transcription import (
     FasterWhisperTranscriber,
     TranscriptionConfig,
     TranscriptionError,
+    _bundled_cuda_dll_directories,
 )
 from asher.voice.types import TranscriptResult
 from asher.voice.vocabulary import DynamicVocabulary
@@ -51,6 +54,41 @@ class FakeModel:
 
 
 class TranscriptionTests(unittest.TestCase):
+    def test_voice2d_production_defaults_use_measured_distil_int8_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {}, clear=True):
+                config = AsherConfig.load(directory)
+
+        self.assertEqual(config.whisper_model, "distil-large-v3")
+        self.assertEqual(config.whisper_device, "auto")
+        self.assertEqual(config.whisper_compute_type, "int8_float16")
+        defaults = TranscriptionConfig()
+        self.assertEqual(defaults.model_size, "distil-large-v3")
+        self.assertEqual(defaults.cuda_compute_type, "int8_float16")
+        self.assertEqual(defaults.language, "en")
+        self.assertFalse(defaults.condition_on_previous_text)
+        self.assertTrue(defaults.vad_filter)
+
+    def test_bundled_windows_cuda_runtime_directories_require_expected_dlls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            site_packages = Path(directory)
+            cublas = site_packages / "nvidia" / "cublas" / "bin"
+            cudnn = site_packages / "nvidia" / "cudnn" / "bin"
+            cublas.mkdir(parents=True)
+            cudnn.mkdir(parents=True)
+
+            # A directory is not trusted merely because the package layout exists.
+            self.assertEqual(_bundled_cuda_dll_directories(site_packages), ())
+
+            (cublas / "cublas64_12.dll").write_bytes(b"fixture")
+            self.assertEqual(_bundled_cuda_dll_directories(site_packages), (cublas,))
+
+            (cudnn / "cudnn64_9.dll").write_bytes(b"fixture")
+            self.assertEqual(
+                _bundled_cuda_dll_directories(site_packages),
+                (cublas, cudnn),
+            )
+
     def test_import_and_model_load_are_lazy(self) -> None:
         created: list[tuple[str, str]] = []
 
@@ -68,7 +106,7 @@ class TranscriptionTests(unittest.TestCase):
         self.assertFalse(transcriber.loaded)
         result = transcriber.transcribe(b"audio", vocabulary=("Avery Stone",))
         self.assertEqual(transcriber.active_device, "cpu")
-        self.assertEqual(created, [("cuda", "float16"), ("cpu", "int8")])
+        self.assertEqual(created, [("cuda", "int8_float16"), ("cpu", "int8")])
         self.assertEqual(result.raw_text, "search A V E R Y")
         self.assertEqual(result.normalized_text, "search A V E R Y")
         self.assertTrue(result.is_confident(0.5))

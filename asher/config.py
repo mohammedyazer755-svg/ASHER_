@@ -92,9 +92,9 @@ class AsherConfig:
     openai_transcribe_model: str = "gpt-4o-transcribe"
     openai_tts_model: str = "gpt-4o-mini-tts"
     voice_profile: str = "asher_male"
-    whisper_model: str = "small.en"
+    whisper_model: str = "distil-large-v3"
     whisper_device: str = "auto"
-    whisper_compute_type: str = "auto"
+    whisper_compute_type: str = "int8_float16"
     microphone_index: int | str | None = None
 
     @property
@@ -131,8 +131,8 @@ class AsherConfig:
             openai_transcribe_model=os.getenv("ASHER_OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip(),
             openai_tts_model=os.getenv("ASHER_OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip(),
             voice_profile=os.getenv("ASHER_VOICE_PROFILE", "asher_male").strip(),
-            whisper_model=os.getenv("ASHER_WHISPER_MODEL", "small.en").strip(),
+            whisper_model=os.getenv("ASHER_WHISPER_MODEL", "distil-large-v3").strip(),
             whisper_device=device,
-            whisper_compute_type=os.getenv("ASHER_WHISPER_COMPUTE_TYPE", "auto").strip(),
+            whisper_compute_type=os.getenv("ASHER_WHISPER_COMPUTE_TYPE", "int8_float16").strip(),
             microphone_index=_microphone_index(),
         )
