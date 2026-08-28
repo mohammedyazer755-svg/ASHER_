@@ -320,10 +320,11 @@ class EnergyGate:
     recognizer.  Active frames should still be passed to a real wake detector.
     """
 
-    def __init__(self, threshold: float = 0.012) -> None:
+    def __init__(self, threshold: float = 0.006) -> None:
         if threshold < 0:
             raise ValueError("threshold must be non-negative")
-        self.threshold = float(threshold)
+        self.base_threshold = float(threshold)
+        self._noise_floor = float(threshold)
 
     def detect(self, sample: Any) -> WakeDetection:
         try:
@@ -336,9 +337,20 @@ class EnergyGate:
             ) ** 0.5 if values else 0.0
         except (TypeError, ValueError, BufferError):
             rms = 0.0
-        score = max(0.0, min(1.0, rms / max(self.threshold, 1e-9)))
+
+        if not hasattr(self, "_noise_floor"):
+            self._noise_floor = rms
+
+        if rms < self._noise_floor:
+            self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
+        else:
+            self._noise_floor = 0.999 * self._noise_floor + 0.001 * rms
+
+        threshold = max(self.base_threshold, self._noise_floor * 2.5)
+        score = max(0.0, min(1.0, rms / max(threshold, 1e-9)))
         return WakeDetection(
-            detected=rms >= self.threshold,
+            detected=rms >= threshold,
             score=score,
             provider="energy-gate",
         )
+

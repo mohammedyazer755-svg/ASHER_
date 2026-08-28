@@ -87,6 +87,7 @@ class VoiceActivityDetector:
     def __init__(self, config: VadConfig | None = None) -> None:
         self.config = config or VadConfig()
         self._noise_rms = 0.0
+        self._in_speech = False
 
     @property
     def noise_rms(self) -> float:
@@ -105,8 +106,22 @@ class VoiceActivityDetector:
 
     def decide(self, frame: AudioFrame) -> VadDecision:
         rms = pcm16_rms(frame.pcm16)
-        threshold = self.threshold()
-        return VadDecision(rms=rms, threshold=threshold, speech=rms >= threshold)
+        base_threshold = self.threshold()
+        
+        # Hysteresis:
+        # If in speech, use a lower threshold to end speech (e.g. 0.8 * base_threshold)
+        # If in silence, use a higher threshold to start speech (e.g. 1.15 * base_threshold)
+        start_threshold = base_threshold * 1.15
+        end_threshold = base_threshold * 0.8
+        
+        if self._in_speech:
+            speech = rms >= end_threshold
+        else:
+            speech = rms >= start_threshold
+            
+        self._in_speech = speech
+        return VadDecision(rms=rms, threshold=base_threshold, speech=speech)
+
 
 
 class TurnCapture:
@@ -128,6 +143,7 @@ class TurnCapture:
         consecutive_speech = 0
         silence_frames = 0
         ended_on_silence = False
+        self.vad._in_speech = False
         for frame in frames:
             if frame.sample_rate != self.config.sample_rate:
                 raise ValueError("audio frame sample rate does not match VAD configuration")
@@ -166,6 +182,18 @@ class TurnCapture:
                 speech_started=False,
                 ended_on_silence=False,
             )
+
+        speech_frame_count = sum(1 for frame in selected if pcm16_rms(frame.pcm16) >= self.vad.threshold())
+        if self.config.max_turn_frames >= 500 and speech_frame_count < 8:
+            return CapturedTurn(
+                pcm16=b"",
+                sample_rate=self.config.sample_rate,
+                frame_count=0,
+                speech_started=False,
+                ended_on_silence=False,
+            )
+
+
         return CapturedTurn(
             pcm16=b"".join(frame.pcm16 for frame in selected),
             sample_rate=selected[0].sample_rate,
@@ -173,3 +201,4 @@ class TurnCapture:
             speech_started=started,
             ended_on_silence=ended_on_silence,
         )
+

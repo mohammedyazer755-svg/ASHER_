@@ -454,7 +454,123 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
         kinds = [event.kind for event in events]
         self.assertNotIn("transcript", kinds)
 
+    def test_capture_trigger_suppresses_tts_and_cooldown(self) -> None:
+        from asher.voice.runtime import AudioFrame, VoiceRuntime
+        from asher.voice.capture import VadConfig
+        from asher.voice.wakeword import TextWakeDetector
+
+        class DummyController:
+            config = SimpleNamespace(whisper_model="fixture", whisper_device="cpu", whisper_compute_type="auto")
+            users = None
+        
+        class MockTTS:
+            is_speaking = True
+            def speak_async(self, text, interrupt=True):
+                return None
+            def stop(self):
+                pass
+
+        class MockBackend:
+            def __init__(self):
+                self.flushed = False
+            def flush(self):
+                self.flushed = True
+            def frames(self, cancellation=None):
+                return iter([])
+
+        controller = DummyController()
+        
+        current_time = 1000.0
+        def mock_clock():
+            return current_time
+
+        # Scenario 1: Suppress frames while TTS is speaking
+        runtime1 = VoiceRuntime(
+            controller,
+            backend=MockBackend(),
+            wake_detector=TextWakeDetector(),
+            tts=MockTTS(),
+            clock=mock_clock,
+        )
+        speech_frame = AudioFrame(b"\xff\x7f" * 320, 16_000)
+        frames_list = [speech_frame] * 10
+        result = runtime1._capture_trigger(iter(frames_list), vad_config=VadConfig(pre_roll_ms=0))
+        self.assertIsNone(result)
+
+        # Scenario 2: Suppress cooldown and trigger transition flushing
+        backend2 = MockBackend()
+        runtime2 = VoiceRuntime(
+            controller,
+            backend=backend2,
+            wake_detector=TextWakeDetector(),
+            tts=MockTTS(),
+            clock=mock_clock,
+        )
+        
+        def frame_generator():
+            runtime2.tts.is_speaking = True
+            for _ in range(5):
+                yield speech_frame
+            runtime2.tts.is_speaking = False
+            yield speech_frame
+            for _ in range(5):
+                yield speech_frame
+            nonlocal current_time
+            current_time += 0.5
+            for _ in range(15):
+                yield speech_frame
+
+        result = runtime2._capture_trigger(frame_generator(), vad_config=VadConfig(pre_roll_ms=0, start_consecutive_frames=2, end_silence_ms=500))
+        self.assertTrue(backend2.flushed)
+        self.assertIsNotNone(result)
+        self.assertTrue(result.speech_started)
+
+
+    def test_vad_rejects_ambient_bursts_but_accepts_speech(self) -> None:
+        from asher.voice.capture import AudioFrame, VoiceActivityDetector, TurnCapture, VadConfig
+        
+        silence_frame = AudioFrame(b"\x00\x00" * 320, 16_000)
+        speech_frame = AudioFrame(b"\xff\x7f" * 320, 16_000)
+        
+        vad = VoiceActivityDetector(VadConfig(absolute_threshold=0.012))
+        capture = TurnCapture(vad)
+        
+        burst_frames = [silence_frame]*5 + [speech_frame]*3 + [silence_frame]*30
+        result = capture.capture(burst_frames)
+        self.assertFalse(result.speech_started)
+        self.assertEqual(result.pcm16, b"")
+        
+        speech_frames = [silence_frame]*5 + [speech_frame]*10 + [silence_frame]*30
+        result = capture.capture(speech_frames)
+        self.assertTrue(result.speech_started)
+        self.assertNotEqual(result.pcm16, b"")
+
+    def test_emergency_stop_stops_tts_immediately(self) -> None:
+        from asher.voice.runtime import VoiceRuntime, TextWakeDetector
+        class MockTTS:
+            def __init__(self):
+                self.stopped = False
+            def stop(self):
+                self.stopped = True
+        
+        class DummyController:
+            config = SimpleNamespace(whisper_model="fixture", whisper_device="cpu", whisper_compute_type="auto")
+            users = None
+
+        controller = DummyController()
+        tts = MockTTS()
+        runtime = VoiceRuntime(
+            controller,
+            wake_detector=TextWakeDetector(),
+            tts=tts,
+        )
+        
+        runtime.stop()
+        self.assertTrue(tts.stopped)
+
+
     def test_registry_loads_wake_and_speaker_models_separately(self) -> None:
+
 
         with TemporaryDirectory() as directory:
             runtime_root = Path(directory)

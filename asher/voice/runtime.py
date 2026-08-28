@@ -105,9 +105,24 @@ class SoundDeviceBackend:
             dtype="int16",
             device=self.device,
         ) as stream:
-            while cancellation is None or not cancellation.cancelled:
-                data, _overflowed = stream.read(self.block_samples)
-                yield AudioFrame(bytes(data), self.sample_rate)
+            self._active_stream = stream
+            try:
+                while cancellation is None or not cancellation.cancelled:
+                    data, _overflowed = stream.read(self.block_samples)
+                    yield AudioFrame(bytes(data), self.sample_rate)
+            finally:
+                self._active_stream = None
+
+    def flush(self) -> None:
+        stream = getattr(self, "_active_stream", None)
+        if stream is not None:
+            try:
+                while stream.read_available > 0:
+                    frames_to_read = min(stream.read_available, 1024)
+                    if frames_to_read > 0:
+                        stream.read(frames_to_read)
+            except Exception:
+                pass
 
 
 class CloudTranscriber:
@@ -1100,9 +1115,17 @@ class VoiceRuntime:
         user has started a turn, let endpointing finish it instead of truncating
         a sentence because the active-listening window expired mid-utterance.
         """
+        flush_fn = getattr(self.backend, "flush", None)
+        if callable(flush_fn):
+            try:
+                flush_fn()
+            except Exception:
+                pass
 
         config = vad_config or WAKE_TURN_VAD
         pre_roll: deque[AudioFrame] = deque(maxlen=config.pre_roll_frames)
+        tts_was_speaking = self._tts_is_speaking()
+
         while not self._stop.cancelled:
             if deadline is not None and self._clock() >= deadline:
                 self._reset_microphone_level()
@@ -1112,6 +1135,27 @@ class VoiceRuntime:
             except StopIteration:
                 self.stop()
                 return None
+
+            is_speaking = self._tts_is_speaking()
+            if tts_was_speaking and not is_speaking:
+                if callable(flush_fn):
+                    try:
+                        flush_fn()
+                    except Exception:
+                        pass
+                self._last_tts_speak_time = self._clock()
+                pre_roll.clear()
+                tts_was_speaking = False
+                continue
+
+            tts_was_speaking = is_speaking
+
+            cooldown_active = (self._clock() - getattr(self, "_last_tts_speak_time", 0.0)) < 0.4
+            if is_speaking or cooldown_active:
+                pre_roll.clear()
+                self._observe_microphone_frame(frame.pcm16, speech_detected=False)
+                continue
+
             speech_detected = self.energy_gate.detect(frame.pcm16).detected
             self._observe_microphone_frame(
                 frame.pcm16,
@@ -1120,6 +1164,7 @@ class VoiceRuntime:
             if not speech_detected:
                 pre_roll.append(frame)
                 continue
+
 
             # A detected user turn is a barge-in signal. Providers are
             # interruptible; stopping here keeps speech from blocking the next
