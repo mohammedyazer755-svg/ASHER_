@@ -230,6 +230,20 @@ class TranscriptionTests(unittest.TestCase):
         )
         self.assertEqual(denied.status, PipelineStatus.LOW_CONFIDENCE)
 
+    def test_wake_words_always_included_in_vocabulary(self) -> None:
+        model = FakeModel()
+        transcriber = FasterWhisperTranscriber(
+            TranscriptionConfig(device="cpu", model_size="fixture"),
+            model_factory=lambda *args, **kwargs: model,
+            cuda_probe=lambda: False,
+        )
+        transcriber.transcribe(b"audio", vocabulary=("Avery Stone",))
+        self.assertEqual(len(model.calls), 1)
+        prompt = model.calls[0][1]["initial_prompt"]
+        self.assertIn("Asher, Hey Asher, Hello Asher, Okay Asher, OK Asher", prompt)
+        # Ensure it is before the dynamic vocabulary
+        self.assertTrue(prompt.index("Hey Asher") < prompt.index("Avery Stone"))
+
 
 class EvaluationTests(unittest.TestCase):
     def test_wer_and_measured_report(self) -> None:

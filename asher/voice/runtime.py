@@ -34,6 +34,7 @@ from asher.voice.wakeword import EnergyGate, TextWakeDetector
 # command endpoint is intentionally more tolerant than the standby/wake turn so
 # ordinary sentence pauses do not split one request into multiple commands.
 WAKE_TURN_VAD = VadConfig()
+
 COMMAND_TURN_VAD = VadConfig(
     end_silence_ms=900,
     pre_roll_ms=240,
@@ -48,7 +49,7 @@ SLEEP_COMMANDS = frozenset(
         "standby",
         "go to standby",
         "that's all",
-        "that’s all",
+        "thatâ€™s all",
         "nothing else",
     }
 )
@@ -689,7 +690,7 @@ class VoiceRuntimeEvent:
 
 
 class VoiceRuntime:
-    """Standby → wake → authenticated session → command loop."""
+    """Standby â†’ wake â†’ authenticated session â†’ command loop."""
 
     def __init__(
         self,
@@ -876,39 +877,51 @@ class VoiceRuntime:
                         continue
                     self._announce_wake_fallback()
                     result = self._transcribe_turn(turn)
-                    if result.status is not PipelineStatus.ACCEPTED:
-                        # Standby noise / failed wake candidates are diagnostic
-                        # only. They are not user conversation and must never be
-                        # persisted as a final transcript.
+
+                    # Wake activation is a lower-risk boundary than command
+                    # execution. A short phrase such as ``Hey Asher`` can be
+                    # decoded correctly while still receiving a confidence
+                    # score below the general command gate. Detect the wake
+                    # phrase before applying that command-confidence gate.
+                    # Speaker/session policy still runs after wake acceptance.
+                    heard = result.transcript.normalized_text or result.transcript.raw_text
+                    try:
+                        wake = self.wake_detector.detect(heard, fuzzy=True)
+                    except TypeError:
+                        wake = self.wake_detector.detect(heard)
+                    if not wake.detected:
                         self._transition(AssistantState.STANDBY, "Wake phrase not detected")
                         self._emit(
-                            "wake_fallback_rejected",
-                            result.clarification or "Wake phrase not detected",
+                            "wake_fallback_rejected"
+                            if result.status is not PipelineStatus.ACCEPTED
+                            else "wake_rejected",
+                            result.clarification
+                            or "Wake phrase not detected by transcript fallback",
                             result.transcript,
                             confidence=result.transcript.acoustic_confidence,
                         )
                         continue
-                    heard = result.executable_command or ""
-                    wake = self.wake_detector.detect(heard)
-                    if not wake.detected:
-                        self._transition(AssistantState.STANDBY, "Wake phrase not detected")
-                        self._emit(
-                            "wake_rejected",
-                            "Wake phrase not detected by transcript fallback",
-                            result.transcript,
-                            confidence=wake.score,
-                        )
-                        continue
+
                     self._accept_wake(
-                        "Hey Asher detected by transcript-only fallback",
+                        f"Hey Asher detected by transcript-only fallback ({wake.provider})",
                         transcript=result.transcript,
-                        confidence=wake.score,
+                        confidence=result.transcript.acoustic_confidence,
                     )
+
                     active_session = self._authenticate_speaker(
                         turn,
                         transcript=result.transcript,
                     )
                     active_until = self._clock() + self.active_window_seconds
+
+                    # A low-confidence inline command may wake ASHER, but it is
+                    # never executed. Capture a fresh command turn instead.
+                    if result.status is not PipelineStatus.ACCEPTED:
+                        self._transition(AssistantState.LISTENING, "Listening for your command")
+                        self._emit("listening", "Yes?", result.transcript)
+                        self._speak("Yes?", return_state=AssistantState.LISTENING)
+                        continue
+
                     command = wake.command
                     if not command:
                         self._transition(AssistantState.LISTENING, "Listening for your command")
@@ -1238,3 +1251,4 @@ def _write_wav(path: Path, pcm16: bytes, sample_rate: int) -> None:
         writer.setsampwidth(2)
         writer.setframerate(sample_rate)
         writer.writeframes(pcm16)
+

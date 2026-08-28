@@ -83,6 +83,7 @@ def _run_one_turn(
     speaker: _SpeakerVerifier,
     *,
     turn_count: int = 1,
+    acoustic_confidence: float = 0.95,
 ):
     actor = SimpleNamespace(user_id="owner-id", role=SimpleNamespace(value="owner"))
 
@@ -118,7 +119,7 @@ def _run_one_turn(
             return TranscriptResult(
                 raw_text=transcript,
                 normalized_text=transcript,
-                acoustic_confidence=0.95,
+                acoustic_confidence=acoustic_confidence,
                 no_speech_probability=0.01,
             )
 
@@ -255,7 +256,206 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
         self.assertIn("wake_detected", kinds)
         self.assertLess(kinds.index("transcribing"), kinds.index("wake_detected"))
 
+    def test_low_confidence_exact_text_wake_still_activates_without_executing(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "hey asher open chrome",
+                WakeWordModelBinding(False),
+                speaker,
+                acoustic_confidence=0.30,
+            )
+
+        self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.transcriber_calls, 1)
+        self.assertEqual(controller.commands, [])
+        kinds = [event.kind for event in events]
+        self.assertIn("wake_detected", kinds)
+        self.assertIn("authenticated", kinds)
+        self.assertIn("listening", kinds)
+        self.assertNotIn("transcript", kinds)
+
+    def test_low_confidence_non_wake_stays_in_standby(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "ordinary background speech",
+                WakeWordModelBinding(False),
+                speaker,
+                acoustic_confidence=0.30,
+            )
+
+        self.assertEqual(speaker.calls, 0)
+        self.assertEqual(controller.commands, [])
+        kinds = [event.kind for event in events]
+        self.assertNotIn("wake_detected", kinds)
+        self.assertIn("wake_fallback_rejected", kinds)
+
+    def test_exact_hey_asher_wakes(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "hey asher open chrome",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+        self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.commands, [("open chrome", SimpleNamespace(actor=SimpleNamespace(user_id="owner-id", role=SimpleNamespace(value="owner"))))])
+        kinds = [event.kind for event in events]
+        self.assertIn("wake_detected", kinds)
+
+    def test_punctuation_variants_wake(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "Hey, Asher! open chrome",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+        self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.commands, [("open chrome", SimpleNamespace(actor=SimpleNamespace(user_id="owner-id", role=SimpleNamespace(value="owner"))))])
+        kinds = [event.kind for event in events]
+        self.assertIn("wake_detected", kinds)
+
+    def test_close_wake_name_distortion_wakes(self) -> None:
+        for distorted_phrase in ("hey ashir open chrome", "hey ashire open chrome", "hey ahsher open chrome", "hey usher open chrome"):
+            speaker = _SpeakerVerifier()
+            with TemporaryDirectory() as directory:
+                controller, events = _run_one_turn(
+                    directory,
+                    distorted_phrase,
+                    WakeWordModelBinding(False),
+                    speaker,
+                )
+            self.assertEqual(speaker.calls, 1)
+            self.assertEqual(controller.commands, [("open chrome", SimpleNamespace(actor=SimpleNamespace(user_id="owner-id", role=SimpleNamespace(value="owner"))))])
+            kinds = [event.kind for event in events]
+            self.assertIn("wake_detected", kinds)
+            wake_detected_event = next(e for e in events if e.kind == "wake_detected")
+            self.assertIn("text-boundary-fuzzy", wake_detected_event.message)
+
+    def test_fuzzy_recovery_only_works_at_turn_start(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "please hey ashir open chrome",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+        self.assertEqual(speaker.calls, 0)
+        self.assertEqual(controller.commands, [])
+        kinds = [event.kind for event in events]
+        self.assertNotIn("wake_detected", kinds)
+
+
+    def test_unrelated_speech_does_not_wake(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "open chrome",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+        self.assertEqual(speaker.calls, 0)
+        self.assertEqual(controller.commands, [])
+        kinds = [event.kind for event in events]
+        self.assertNotIn("wake_detected", kinds)
+
+    def test_i_should_explain_machine_learning_does_not_wake(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "I should explain machine learning",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+        self.assertEqual(speaker.calls, 0)
+        self.assertEqual(controller.commands, [])
+        kinds = [event.kind for event in events]
+        self.assertNotIn("wake_detected", kinds)
+
+    def test_they_ushered_us_into_the_room_does_not_wake(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "They ushered us into the room",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+        self.assertEqual(speaker.calls, 0)
+        self.assertEqual(controller.commands, [])
+        kinds = [event.kind for event in events]
+        self.assertNotIn("wake_detected", kinds)
+
+    def test_aesthetic_confusions_whole_utterance_only(self) -> None:
+        for confusion in ("ahshel", "yeah sir", "yeah i should", "he has it"):
+            speaker = _SpeakerVerifier()
+            with TemporaryDirectory() as directory:
+                controller, events = _run_one_turn(
+                    directory,
+                    confusion,
+                    WakeWordModelBinding(False),
+                    speaker,
+                )
+            self.assertEqual(speaker.calls, 1)
+            kinds = [event.kind for event in events]
+            self.assertIn("wake_detected", kinds)
+
+        for sentence in ("Yeah sir, that is correct", "I should explain machine learning", "Ashely open calculator"):
+            speaker = _SpeakerVerifier()
+            with TemporaryDirectory() as directory:
+                controller, events = _run_one_turn(
+                    directory,
+                    sentence,
+                    WakeWordModelBinding(False),
+                    speaker,
+                )
+            self.assertEqual(speaker.calls, 0)
+            kinds = [event.kind for event in events]
+            self.assertNotIn("wake_detected", kinds)
+
+    def test_low_confidence_fuzzy_text_wake_still_activates_without_executing(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "hey ashir open chrome",
+                WakeWordModelBinding(False),
+                speaker,
+                acoustic_confidence=0.30,
+            )
+
+        self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.transcriber_calls, 1)
+        self.assertEqual(controller.commands, [])
+        kinds = [event.kind for event in events]
+        self.assertIn("wake_detected", kinds)
+        self.assertIn("authenticated", kinds)
+        self.assertIn("listening", kinds)
+        self.assertNotIn("transcript", kinds)
+
+    def test_no_conversation_history_for_rejected_wake(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "ordinary background speech",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+        kinds = [event.kind for event in events]
+        self.assertNotIn("transcript", kinds)
+
     def test_registry_loads_wake_and_speaker_models_separately(self) -> None:
+
         with TemporaryDirectory() as directory:
             runtime_root = Path(directory)
             _trained_manager(runtime_root)

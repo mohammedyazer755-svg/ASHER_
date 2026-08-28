@@ -342,8 +342,12 @@ class FasterWhisperTranscriber:
             cancellation.raise_if_cancelled()
         self.load()
         prompt_parts = [initial_prompt.strip()]
+        wake_terms = ("Asher", "Hey Asher", "Hello Asher", "Okay Asher", "OK Asher")
         clean_vocabulary = tuple(
             dict.fromkeys(str(item).strip() for item in vocabulary if str(item).strip())
+        )
+        clean_vocabulary = wake_terms + tuple(
+            item for item in clean_vocabulary if item not in wake_terms
         )
         if clean_vocabulary:
             prompt_parts.append("Relevant names and applications: " + ", ".join(clean_vocabulary))
