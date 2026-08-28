@@ -6,7 +6,7 @@ Deliver VOICE-2: a reliable local-first daily-use voice pipeline with a dedicate
 
 ## 2. CURRENT SUB-MILESTONE
 
-VOICE-2A - AUDIT + BASELINE is complete. The next sub-milestone is VOICE-2B - WAKE BOUNDARY; no production edit for 2B has started yet.
+VOICE-2B - WAKE BOUNDARY is complete and green. The dedicated wake-decision order is internally complete; the checkpoint commit remains. VOICE-2C must next separate wake audio from one complete command turn.
 
 ## 3. WHAT WAS ALREADY COMPLETED
 
@@ -22,10 +22,17 @@ VOICE-2A - AUDIT + BASELINE is complete. The next sub-milestone is VOICE-2B - WA
   - GPU: NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB total; it was idle when sampled.
   - Windows/sounddevice default input index: 1 (Realtek microphone array). `.env` has no `ASHER_MIC_INDEX`, so automatic selection is active.
   - Only `small.en` is currently cached locally; no stronger Faster-Whisper candidate is cached.
-  - The VoiceGuard registry exists but has 0/3 wake binding keys, no wake model file, and no active speaker model file. The actual runtime therefore uses text wake fallback and guest access today.
-- Established these verified implementation facts:
-  - `VoiceRuntime.run_forever()` currently captures and transcribes every energy-triggered utterance before checking `TextWakeDetector`.
-  - A trained `WakeWordModelBinding` is currently invoked only after exact transcript wake matching, so acoustic wake acceptance cannot rescue a mis-transcribed “Hey Asher”.
+- The VoiceGuard registry exists but has 0/3 wake binding keys, no wake model file, and no active speaker model file. The actual runtime therefore uses text wake fallback and guest access today.
+- Created Git checkpoint `de076cb` (`VOICE-2A audit and baseline`) containing only this continuation handoff. The five pre-existing user-modified files were not staged or committed.
+- Reordered the runtime wake boundary for a trained artifact: acoustic `WakeWordModelBinding.verify()` now runs before STT; accepted wake then performs separate speaker authentication, then command transcription.
+- Kept transcript wake matching only as a clearly emitted `wake_fallback` when the registry proves that no acoustic wake artifact is active.
+- Preserved fail-closed behavior if an artifact is active/stale/invalid: no text fallback, no STT, and no speaker authentication after rejection.
+- Replaced the regression that required exact Whisper wake text with a regression proving an acoustic wake can accept transcript text `open chrome` and route that command.
+- Added regression proof that acoustic rejection causes zero transcriber calls and zero speaker-verifier calls.
+- Completed an independent read-only 2B diff review. It confirmed the new acceptance order and identified the still-unimplemented 2C boundary: a combined trained-wake utterance is still transcribed as one buffer, so a bad decoded wake prefix can remain in the command even though activation itself no longer depends on that prefix.
+- Established these verified baseline facts (the first two are now fixed by the uncommitted 2B implementation):
+  - Baseline `VoiceRuntime.run_forever()` captured and transcribed every energy-triggered utterance before checking `TextWakeDetector`.
+  - Baseline `WakeWordModelBinding` was invoked only after exact transcript wake matching, so acoustic wake acceptance could not rescue a mis-transcribed “Hey Asher”.
   - `VoiceRuntime` emits a permanent `transcript` event before wake acceptance/rejection; `CompanionDesktopController._on_voice_event()` appends that event to Conversation history.
   - Wake and speaker model artifacts/loaders are separate, and wake rejection already prevents speaker authentication once the text gate has been passed.
   - `TurnCapture` does return a single buffer and ends after configured silence, but the runtime creates a new capture from the first energy frame with no retained standby pre-roll. Its 550 ms endpoint can split natural pauses.
@@ -39,13 +46,15 @@ VOICE-2A - AUDIT + BASELINE is complete. The next sub-milestone is VOICE-2B - WA
 
 ## 4. EXACT FILES CHANGED
 
-- `VOICE2_CONTINUATION.md` — created as the authoritative resumable VOICE-2 handoff.
-
-No production or test source file has been changed for VOICE-2 yet.
+- `VOICE2_CONTINUATION.md` - maintained after the 2A checkpoint and during 2B.
+- `asher/voice/runtime.py` - reordered wake/acoustic/STT/authentication boundaries and extracted small wake/auth/transcription helpers.
+- `tests/test_wake_word_runtime_binding.py` - replaced the contradictory text-first contract and added trained-acoustic/fallback/rejection call-count coverage.
 
 ## 5. WHY EACH FILE WAS CHANGED
 
 - `VOICE2_CONTINUATION.md`: required by the continuation protocol so the milestone can resume from repository state alone.
+- `asher/voice/runtime.py`: ensure a trained acoustic detector, not Whisper spelling, is the primary wake decision; label the degraded no-model fallback.
+- `tests/test_wake_word_runtime_binding.py`: lock in wake-before-STT, wake-before-speaker-auth, rejection isolation, and explicit fallback behavior.
 
 ## 6. TESTS ALREADY RUN
 
@@ -53,6 +62,10 @@ No production or test source file has been changed for VOICE-2 yet.
 - `.\.venv\Scripts\python.exe -B test_voice_accuracy.py`
 - Read-only audit agent focused run: `python -B -m unittest tests.test_voice_wake_capture tests.test_wake_word_runtime_binding tests.test_ui_adapter tests.test_tts tests.test_agent_integration tests.test_security`
 - Read-only audit agent broader focused voice/evaluation/security run (exact module selection recorded in the agent audit): 67 tests.
+- `.\.venv\Scripts\python.exe -B -m unittest tests.test_wake_word_runtime_binding tests.test_voice_wake_capture -v`
+- `.\.venv\Scripts\python.exe -B -m unittest tests.test_wake_word_runtime_binding tests.test_voice_wake_capture tests.test_voice_transcription tests.test_ui_adapter tests.test_security -v`
+- `.\.venv\Scripts\python.exe -B -m compileall -q asher tests`
+- `git diff --check`
 
 ## 7. EXACT TEST RESULTS / COUNTS
 
@@ -64,10 +77,16 @@ No production or test source file has been changed for VOICE-2 yet.
 - Direct legacy normalization smoke result: PASS (exit 0). This checks static text normalization only; it is not an acoustic wake/STT accuracy measurement.
 - Focused integration audit result: 54/54 passed in 11.692 seconds.
 - Broader focused audit result: 67/67 passed. These focused runs overlap and must not be added together as unique tests.
+- Post-2B focused result: 15/15 passed in 3.699 seconds.
+- Post-2B broader focused result: 47/47 passed in 5.502 seconds.
+- Post-2B compileall: PASS (exit 0).
+- Post-2B `git diff --check`: PASS (exit 0); only expected Git LF-to-CRLF working-copy warnings were printed.
 
 ## 8. CURRENT KNOWN FAILURE
 
-Primary VOICE-2 failure: standby wake acceptance is ordered as energy/VAD capture → Whisper → exact text wake match → acoustic wake binding. This makes Whisper’s spelling of “Hey Asher” mandatory even when a trained acoustic wake verifier exists.
+The primary text-before-acoustic wake-order defect is fixed in the working tree and covered by focused tests, but is not checkpointed yet.
+
+Known next-stage defect (do not misreport as fixed): on the trained path, the currently captured standby candidate still contains wake plus any inline command. If acoustic wake accepts but Whisper decodes `hey usher open chrome`, exact wake-prefix stripping does not match and the full malformed string can reach the controller. VOICE-2C must preserve post-trigger audio/capture exactly one command turn; do not solve this with alias replacements.
 
 Secondary failures: pre-wake/rejected transcripts can pollute permanent Conversation history; endpointing begins without retained pre-roll and can cut/split natural turns; microphone failure copy is not actionable; real start-stop-start and full end-to-end voice acceptance have not been physically verified.
 
@@ -91,7 +110,7 @@ Unrelated baseline failure: the single companion fullscreen test listed above. D
 
 ## 10. WHAT IS STILL UNIMPLEMENTED
 
-- VOICE-2B dedicated acoustic-before-STT wake path and clearly labelled text fallback.
+- VOICE-2B dedicated acoustic-before-STT wake path and clearly labelled text fallback: COMPLETE and focused-test green.
 - VOICE-2C robust full-turn buffering/pre-roll/endpointing and final-transcript-only persistence.
 - VOICE-2D real current-vs-stronger STT benchmark, model selection, resource observations, and explicit “Asher” vocabulary bias.
 - VOICE-2E actionable microphone diagnostics and deterministic Start → Stop → Start coverage.
@@ -100,18 +119,18 @@ Unrelated baseline failure: the single companion fullscreen test listed above. D
 
 ## 11. EXACT NEXT ACTION
 
-Implement VOICE-2B as the smallest coherent change: make a trained acoustic `WakeWordModelBinding` decide a standby candidate before STT, keep exact text matching only as a clearly emitted fallback when no trained artifact exists, and retain speaker authentication as a later independent step. Replace the regression that currently requires text before the acoustic verifier.
+Stage and commit only `VOICE2_CONTINUATION.md`, `asher/voice/runtime.py`, and `tests/test_wake_word_runtime_binding.py` as `VOICE-2B dedicated wake boundary`. Then advance the handoff to VOICE-2C and implement distinct wake-audio/command-turn capture without wake-text aliases.
 
 ## 12. EXACT NEXT FILE/FUNCTION TO INSPECT OR EDIT
 
-- Edit `VoiceRuntime.run_forever()` in `asher/voice/runtime.py`, extracting a small standby wake-decision helper so `WakeWordModelBinding.verify()` can run before `VoiceAccuracyPipeline.process()`.
-- Update `tests/test_wake_word_runtime_binding.py:162-209` to assert trained acoustic acceptance does not depend on exact Whisper wake text and rejected acoustic wake never calls STT or speaker authentication.
+- Next production work after the 2B checkpoint is in `VoiceRuntime.run_forever()` and `_capture_trigger()` in `asher/voice/runtime.py`, plus `TurnCapture`/`VadConfig` in `asher/voice/capture.py`.
+- Add the one-complete-command and accepted-final-transcript regressions in `tests/test_voice_wake_capture.py` and `tests/test_ui_adapter.py`.
 - Do not edit the planner/provider files.
 
 ## 13. EXACT COMMAND TO RUN NEXT
 
 ```powershell
-.\.venv\Scripts\python.exe -B -m unittest tests.test_wake_word_runtime_binding tests.test_voice_wake_capture -v
+git add -- VOICE2_CONTINUATION.md asher/voice/runtime.py tests/test_wake_word_runtime_binding.py
 ```
 
 After the focused tests, run:
@@ -130,9 +149,11 @@ Pre-existing user work (present before VOICE-2; preserve and do not include in V
 - `tests/test_providers.py`
 - `tests/test_ui.py`
 
-VOICE-2 work currently untracked:
+VOICE-2 work currently modified after the VOICE-2A checkpoint:
 
-- `VOICE2_CONTINUATION.md`
+- `VOICE2_CONTINUATION.md` - advanced the handoff to VOICE-2B and recorded checkpoint `de076cb`.
+- `asher/voice/runtime.py` - 2B wake-boundary implementation; focused tests pass.
+- `tests/test_wake_word_runtime_binding.py` - 2B regression updates; focused tests pass.
 
 ## 15. ANY IMPORTANT ARCHITECTURAL DECISIONS
 
@@ -156,4 +177,4 @@ VOICE-2 work currently untracked:
 
 ## 17. CURRENT GIT COMMIT HASH
 
-`7c1947e03c4a29719d8ad93c1636d1df33a1601b`
+`de076cba6f4d712669eb6e81c55b511185463039`

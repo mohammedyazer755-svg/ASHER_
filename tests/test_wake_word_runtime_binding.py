@@ -105,8 +105,11 @@ def _run_one_turn(
             return CompanionReply("fixture reply")
 
     class Transcriber:
-        @staticmethod
-        def transcribe(_audio, **_kwargs):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def transcribe(self, _audio, **_kwargs):
+            self.calls += 1
             return TranscriptResult(
                 raw_text=transcript,
                 normalized_text=transcript,
@@ -121,16 +124,18 @@ def _run_one_turn(
 
     controller = Controller()
     events = []
+    transcriber = Transcriber()
     runtime = _ScriptedRuntime(
         controller,
         backend=Backend(),
-        transcriber=Transcriber(),
+        transcriber=transcriber,
         wake_word_binding=binding,
         voiceguard=speaker,
         tts=_FakeTTS(),
         on_event=events.append,
     )
     runtime.run_forever()
+    controller.transcriber_calls = transcriber.calls
     return controller, events
 
 
@@ -159,7 +164,7 @@ def _controller(runtime_root: Path):
 
 
 class WakeWordRuntimeBindingTests(unittest.TestCase):
-    def test_text_boundary_remains_mandatory_when_trained_model_accepts(self) -> None:
+    def test_trained_audio_wake_does_not_require_an_exact_whisper_phrase(self) -> None:
         wake = _WakeVerifier(True)
         speaker = _SpeakerVerifier()
         with TemporaryDirectory() as directory:
@@ -170,10 +175,16 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
                 speaker,
             )
 
-        self.assertEqual(wake.calls, 0)
-        self.assertEqual(speaker.calls, 0)
-        self.assertEqual(controller.commands, [])
-        self.assertNotIn("wake_detected", {event.kind for event in events})
+        self.assertEqual(wake.calls, 1)
+        self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.transcriber_calls, 1)
+        self.assertEqual(
+            [command for command, _session in controller.commands],
+            ["open chrome"],
+        )
+        kinds = [event.kind for event in events]
+        self.assertLess(kinds.index("wake_detected"), kinds.index("authenticated"))
+        self.assertLess(kinds.index("authenticated"), kinds.index("transcribing"))
 
     def test_wake_acceptance_precedes_separate_speaker_authentication(self) -> None:
         wake = _WakeVerifier(True)
@@ -188,6 +199,7 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
 
         self.assertEqual(wake.calls, 1)
         self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.transcriber_calls, 1)
         self.assertEqual([command for command, _session in controller.commands], ["open chrome"])
         kinds = [event.kind for event in events]
         self.assertLess(kinds.index("wake_detected"), kinds.index("authenticated"))
@@ -205,8 +217,30 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
 
         self.assertEqual(wake.calls, 1)
         self.assertEqual(speaker.calls, 0)
+        self.assertEqual(controller.transcriber_calls, 0)
         self.assertEqual(controller.commands, [])
         self.assertIn("wake_rejected", {event.kind for event in events})
+
+    def test_text_wake_is_an_explicit_fallback_only_without_an_audio_artifact(self) -> None:
+        speaker = _SpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "hey asher open chrome",
+                WakeWordModelBinding(False),
+                speaker,
+            )
+
+        self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.transcriber_calls, 1)
+        self.assertEqual(
+            [command for command, _session in controller.commands],
+            ["open chrome"],
+        )
+        kinds = [event.kind for event in events]
+        self.assertIn("wake_fallback", kinds)
+        self.assertIn("wake_detected", kinds)
+        self.assertLess(kinds.index("transcribing"), kinds.index("wake_detected"))
 
     def test_registry_loads_wake_and_speaker_models_separately(self) -> None:
         with TemporaryDirectory() as directory:

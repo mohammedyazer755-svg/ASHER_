@@ -736,6 +736,7 @@ class VoiceRuntime:
         self._stop = CancellationToken()
         self._microphone_level_lock = threading.Lock()
         self._microphone_level = 0.0
+        self._wake_fallback_announced = False
 
     @property
     def microphone_level(self) -> float:
@@ -810,27 +811,50 @@ class VoiceRuntime:
                     continue
                 if not turn.pcm16:
                     continue
-                # Faster-Whisper accepts a path/array rather than arbitrary
-                # PCM bytes.  Keep the turn in a short-lived WAV and remove it
-                # immediately after local/optional remote transcription; no
-                # recording is retained by the runtime.
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
-                    turn_path = Path(temporary.name)
-                try:
-                    self._transition(AssistantState.TRANSCRIBING, "Understanding speech")
-                    self._emit("transcribing", "Understanding speech")
-                    _write_wav(turn_path, turn.pcm16, turn.sample_rate)
-                    result = self.pipeline.process(
-                        turn_path,
-                        allow_remote_fallback=self.cloud_transcriber is not None,
-                        cancellation=self._stop,
+                if active_session is None:
+                    binding = (
+                        self._wake_word_binding_override
+                        if self._wake_word_binding_override is not None
+                        else load_active_wake_word_binding(self.controller)
                     )
-                finally:
-                    turn_path.unlink(missing_ok=True)
+                    if binding.active_artifact:
+                        wake_accepted, wake_score, _wake_reason = binding.verify(
+                            turn.pcm16,
+                            turn.sample_rate,
+                        )
+                        if not wake_accepted:
+                            self._reject_wake(
+                                "Wake phrase was not verified by the active wake-word model",
+                                confidence=wake_score,
+                            )
+                            continue
+                        self._accept_wake(
+                            "Hey Asher detected by the trained acoustic wake model",
+                            confidence=wake_score,
+                        )
+                        active_session = self._authenticate_speaker(turn)
+                        active_until = self._clock() + self.active_window_seconds
+                        result = self._transcribe_turn(turn)
+                    else:
+                        fallback_allowed, fallback_score, fallback_reason = binding.verify(
+                            turn.pcm16,
+                            turn.sample_rate,
+                        )
+                        if not fallback_allowed:
+                            self._reject_wake(
+                                fallback_reason,
+                                confidence=fallback_score,
+                            )
+                            continue
+                        self._announce_wake_fallback()
+                        result = self._transcribe_turn(turn)
+                else:
+                    result = self._transcribe_turn(turn)
+
                 self._emit("transcript", result.clarification or result.executable_command or "", result.transcript, confidence=result.transcript.acoustic_confidence)
                 if result.status is not PipelineStatus.ACCEPTED:
                     self._emit("clarification", result.clarification or "Please repeat that.", result.transcript)
-                    if active:
+                    if active_session is not None:
                         self._speak(result.clarification or "Please repeat that.")
                         active_until = self._clock() + self.active_window_seconds
                     continue
@@ -838,66 +862,26 @@ class VoiceRuntime:
                 heard = result.executable_command or ""
                 wake = self.wake_detector.detect(heard)
                 if active_session is None:
+                    # This is the explicitly degraded path used only when the
+                    # registry proves no trained acoustic wake artifact exists.
                     if not wake.detected:
                         self._transition(AssistantState.STANDBY, "Wake phrase not detected")
                         continue
-                    binding = (
-                        self._wake_word_binding_override
-                        if self._wake_word_binding_override is not None
-                        else load_active_wake_word_binding(self.controller)
+                    self._accept_wake(
+                        "Hey Asher detected by transcript-only fallback",
+                        transcript=result.transcript,
+                        confidence=wake.score,
                     )
-                    wake_accepted, wake_score, _wake_reason = binding.verify(
-                        turn.pcm16,
-                        turn.sample_rate,
+                    active_session = self._authenticate_speaker(
+                        turn,
+                        transcript=result.transcript,
                     )
-                    if not wake_accepted:
-                        message = "Wake phrase was not verified by the active wake-word model"
-                        self._transition(AssistantState.STANDBY, message)
-                        self._emit(
-                            "wake_rejected",
-                            message,
-                            result.transcript,
-                            confidence=wake_score,
-                        )
-                        continue
-                    self._transition(AssistantState.WAKE_DETECTED, "Hey Asher detected")
-                    self._emit(
-                        "wake_detected",
-                        "Hey Asher detected",
-                        result.transcript,
-                        confidence=wake_score,
-                    )
-                    self._transition(AssistantState.AUTHENTICATING, "Verifying speaker")
-                    self._emit("authenticating", "Verifying speaker", result.transcript)
-                    owner_id = None
-                    score = None
-                    reason = "VoiceGuard not enrolled; guest session"
-                    if self.voiceguard is not None:
-                        owner_id, score, reason = self.voiceguard.authenticate(turn.pcm16, turn.sample_rate)
-                    actor = self.controller.users.get(owner_id) if owner_id else None
-                    if actor is not None and actor.role.value in {"owner", "trusted"}:
-                        active_session = self.controller.create_voice_session(actor)
-                        self._transition(
-                            AssistantState.AUTHENTICATED,
-                            "Speaker authenticated",
-                            actor_id=getattr(actor, "user_id", None),
-                            confidence=score,
-                        )
-                        self._emit("authenticated", reason, result.transcript, confidence=score)
-                    else:
-                        active_session = self.controller.create_guest_session()
-                        self._transition(
-                            AssistantState.LOCKED,
-                            "Private actions locked; guest conversation only",
-                            confidence=score,
-                        )
-                        self._emit("guest", "Wake phrase heard, but speaker authentication did not grant private access.", result.transcript, confidence=score)
                     active_until = self._clock() + self.active_window_seconds
                     command = wake.command
                 else:
-                    # During the short active window a follow-up command does
-                    # not need to repeat the wake phrase. Repeating it remains
-                    # harmless and strips it from the executable command.
+                    # A trained acoustic wake already authorized activation, so
+                    # text matching is useful only for stripping a correctly
+                    # decoded prefix. It is never a second acceptance gate.
                     command = wake.command if wake.detected else heard
 
                 if not command:
@@ -926,6 +910,109 @@ class VoiceRuntime:
             self.stop()
         finally:
             self._reset_microphone_level()
+
+    def _transcribe_turn(self, turn: Any):
+        """Transcribe one captured turn without retaining its temporary WAV."""
+
+        # Faster-Whisper accepts a path/array rather than arbitrary PCM bytes.
+        # Keep the turn in a short-lived WAV and remove it immediately after
+        # local/optional remote transcription; no recording is retained.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+            turn_path = Path(temporary.name)
+        try:
+            self._transition(AssistantState.TRANSCRIBING, "Understanding speech")
+            self._emit("transcribing", "Understanding speech")
+            _write_wav(turn_path, turn.pcm16, turn.sample_rate)
+            return self.pipeline.process(
+                turn_path,
+                allow_remote_fallback=self.cloud_transcriber is not None,
+                cancellation=self._stop,
+            )
+        finally:
+            turn_path.unlink(missing_ok=True)
+
+    def _announce_wake_fallback(self) -> None:
+        if self._wake_fallback_announced:
+            return
+        self._wake_fallback_announced = True
+        self._emit(
+            "wake_fallback",
+            "Personalized wake model is not trained; using transcript-only wake fallback",
+        )
+
+    def _accept_wake(
+        self,
+        message: str,
+        *,
+        transcript: TranscriptResult | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        self._transition(AssistantState.WAKE_DETECTED, message)
+        self._emit(
+            "wake_detected",
+            message,
+            transcript,
+            confidence=confidence,
+        )
+
+    def _reject_wake(
+        self,
+        message: str,
+        *,
+        transcript: TranscriptResult | None = None,
+        confidence: float | None = None,
+    ) -> None:
+        self._transition(AssistantState.STANDBY, message)
+        self._emit(
+            "wake_rejected",
+            message,
+            transcript,
+            confidence=confidence,
+        )
+
+    def _authenticate_speaker(
+        self,
+        turn: Any,
+        *,
+        transcript: TranscriptResult | None = None,
+    ) -> Any:
+        """Authenticate only after wake acceptance; wake is not authorization."""
+
+        self._transition(AssistantState.AUTHENTICATING, "Verifying speaker")
+        self._emit("authenticating", "Verifying speaker", transcript)
+        owner_id = None
+        score = None
+        reason = "VoiceGuard not enrolled; guest session"
+        if self.voiceguard is not None:
+            owner_id, score, reason = self.voiceguard.authenticate(
+                turn.pcm16,
+                turn.sample_rate,
+            )
+        actor = self.controller.users.get(owner_id) if owner_id else None
+        if actor is not None and actor.role.value in {"owner", "trusted"}:
+            session = self.controller.create_voice_session(actor)
+            self._transition(
+                AssistantState.AUTHENTICATED,
+                "Speaker authenticated",
+                actor_id=getattr(actor, "user_id", None),
+                confidence=score,
+            )
+            self._emit("authenticated", reason, transcript, confidence=score)
+            return session
+
+        session = self.controller.create_guest_session()
+        self._transition(
+            AssistantState.LOCKED,
+            "Private actions locked; guest conversation only",
+            confidence=score,
+        )
+        self._emit(
+            "guest",
+            "Wake phrase heard, but speaker authentication did not grant private access.",
+            transcript,
+            confidence=score,
+        )
+        return session
 
     def _capture_trigger(self, frames: Any, *, deadline: float | None = None):
         # Skip silence cheaply, then let VAD collect a complete turn.
