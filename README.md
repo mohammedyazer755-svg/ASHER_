@@ -12,7 +12,7 @@
   <img src="docs/assets/asher-demo-preview.gif" width="100%" alt="ASHER Demo Preview">
 </p>
 
-▶ **[Watch the full ASHER demo](docs/assets/asher-demo.mp4)**
+▶ **[Open / download the full ASHER demo](docs/assets/asher-demo.mp4?raw=1)**
 
 The demo shows ASHER transitioning from the Workspace into Companion Mode during live voice interaction.
 
