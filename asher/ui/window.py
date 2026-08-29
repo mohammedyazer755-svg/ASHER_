@@ -28,6 +28,7 @@ from asher.ui.controller import (
     UserRecord,
 )
 from asher.ui.orb_widget import AsherOrbWidget, visual_for_state
+from asher.ui.web_orb_widget import CompanionOrbHost
 from asher.ui.workers import FunctionWorker, QT_WORKERS_AVAILABLE
 
 
@@ -143,6 +144,9 @@ else:
     QLabel#companionTelemetry { background: rgba(121, 223, 255, 16); color: #aeeeff; border: 1px solid rgba(121, 223, 255, 38); border-radius: 9px; font-size: 8pt; letter-spacing: 1px; padding: 5px 10px; }
     QPushButton#companionStop { background: rgba(66, 18, 28, 150); color: #ffcbd3; border: 1px solid rgba(199, 70, 90, 135); border-radius: 9px; padding: 6px 13px; font-weight: 700; }
     QPushButton#companionStop:hover { background: rgba(111, 27, 42, 190); }
+    QPushButton#companionGesture { background: rgba(28, 72, 91, 92); color: #cff7ff; border: 1px solid rgba(121, 223, 255, 58); border-radius: 9px; padding: 6px 11px; font-size: 8pt; letter-spacing: 1px; }
+    QPushButton#companionGesture:checked { background: rgba(42, 126, 151, 130); border-color: rgba(180, 244, 255, 125); }
+    QPushButton#companionGesture:disabled { color: rgba(171, 194, 203, 90); border-color: rgba(121, 223, 255, 20); }
     QFrame#companionConfirm { background: rgba(7, 27, 44, 232); border: 1px solid rgba(255, 180, 74, 120); border-radius: 12px; }
     QLabel#statusChip { background: #1b3150; color: #bcd7f7; border-radius: 10px; padding: 5px 10px; }
     QLabel#warning { background: #4b3416; color: #ffd994; border: 1px solid #916721; border-radius: 8px; padding: 8px; }
@@ -331,16 +335,26 @@ else:
             self.setAutoFillBackground(True)
             root = QVBoxLayout(self)
             self.root_layout = root
-            root.setContentsMargins(24, 16, 24, 18)
+            # Full-frame Companion canvas. Controls keep their own padding.
+            root.setContentsMargins(0, 0, 0, 0)
             root.setSpacing(0)
 
             top = QHBoxLayout()
-            top.setContentsMargins(0, 0, 0, 0)
+            top.setContentsMargins(24, 16, 24, 8)
             self.brand = _label("ASHER", "companionBrand")
             top.addWidget(self.brand)
             top.addStretch()
             self.presence = _label("LOCAL", "companionTelemetry")
             top.addWidget(self.presence)
+            gesture = QPushButton("GESTURES")
+            gesture.setObjectName("companionGesture")
+            gesture.setCheckable(True)
+            gesture.setToolTip(
+                "Enable local camera hand tracking for visual rotation and energy unfolding"
+            )
+            gesture.toggled.connect(self._toggle_gestures)
+            self.gesture_button = gesture
+            top.addWidget(gesture)
             stop = QPushButton("STOP")
             stop.setObjectName("companionStop")
             stop.setToolTip("Emergency stop — cancel the active ASHER plan and voice output")
@@ -351,13 +365,15 @@ else:
             self.top_layout = top
             root.addLayout(top)
 
-            root.addStretch(1)
-            self.orb = AsherOrbWidget(self)
-            self.orb.set_cinematic_mode(True)
-            self.orb.set_interactive_resize(True, initial_size=700)
+            self.orb = CompanionOrbHost(self)
             self.orb.set_overlay_text("LISTENING", "")
-            root.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
-            root.addStretch(1)
+            self.orb.rendererChanged.connect(self._renderer_changed)
+            self.orb.gestureStateChanged.connect(self._gesture_state_changed)
+            self._renderer_changed(
+                self.orb.uses_webgl,
+                self.orb.renderer_error or "Local WebGL renderer is starting",
+            )
+            root.addWidget(self.orb, 1)
 
             # Hidden compatibility labels keep real state/message text available
             # to accessibility/smoke tests without cluttering the immersive view.
@@ -403,10 +419,28 @@ else:
             root.addWidget(self.confirm, 0, Qt.AlignmentFlag.AlignHCenter)
             QTimer.singleShot(0, self._fit_orb_to_viewport)
 
-        def _fit_orb_to_viewport(self) -> int:
-            """Keep the dominant square orb fully inside the live viewport."""
+        def _renderer_changed(self, webgl_active: bool, detail: str) -> None:
+            self.gesture_button.setEnabled(bool(webgl_active))
+            self.gesture_button.setToolTip(str(detail or "Local WebGL renderer"))
+            if not webgl_active and self.gesture_button.isChecked():
+                self.gesture_button.setChecked(False)
 
-            margins = self.root_layout.contentsMargins()
+        def _toggle_gestures(self, enabled: bool) -> None:
+            applied = self.orb.set_gesture_enabled(bool(enabled))
+            if applied != bool(enabled):
+                self.gesture_button.setChecked(applied)
+            self.gesture_button.setText("GESTURES ON" if applied else "GESTURES")
+
+        def _gesture_state_changed(self, enabled: bool, detail: str) -> None:
+            if self.gesture_button.isChecked() != bool(enabled):
+                self.gesture_button.setChecked(bool(enabled))
+            self.gesture_button.setText("GESTURES ON" if enabled else "GESTURES")
+            if detail:
+                self.gesture_button.setToolTip(str(detail))
+
+        def _fit_orb_to_viewport(self) -> int:
+            """Keep WebGL fluid and report the usable viewport short edge."""
+
             top_height = max(
                 self.brand.sizeHint().height(),
                 self.stop_button.sizeHint().height(),
@@ -414,18 +448,19 @@ else:
             confirmation_height = (
                 self.confirm.sizeHint().height() if not self.confirm.isHidden() else 0
             )
-            available_width = self.width() - margins.left() - margins.right()
-            available_height = (
-                self.height()
-                - margins.top()
-                - margins.bottom()
-                - top_height
-                - confirmation_height
-                - 16
+            available_width = max(1, self.width())
+            available_height = max(
+                1,
+                self.height() - top_height - confirmation_height - 24,
             )
-            maximum = max(340, min(700, available_width, available_height))
-            self.orb.set_display_bounds(340, maximum)
-            return self.orb.set_display_size(maximum)
+            self.orb.setMinimumSize(1, 1)
+            self.orb.setMaximumSize(16777215, 16777215)
+            self.orb.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding,
+            )
+            self.orb.updateGeometry()
+            return min(available_width, available_height)
 
         def resizeEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback
             super().resizeEvent(event)
@@ -1375,6 +1410,7 @@ else:
         def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt callback name
             self._timer.stop()
             self._audio_timer.stop()
+            self.companion_mode.orb.shutdown()
             if self._state_unsubscribe is not None:
                 self._state_unsubscribe()
                 self._state_unsubscribe = None

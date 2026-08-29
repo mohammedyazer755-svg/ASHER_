@@ -506,7 +506,7 @@ else:
             if self._cinematic_mode:
                 # The fixed canvas never reflows.  Only the painted glass body
                 # grows, from a quiet 70% presence to a voice-active 98% one.
-                base_radius = extent * 0.320
+                base_radius = extent * 0.345
                 radius = base_radius * self.current_visual_scale() * (1.0 + breath)
                 self._paint_cinematic(painter, center, radius, width, height)
                 return
@@ -541,6 +541,9 @@ else:
             self._draw_atomic_core(painter, center, radius)
             self._draw_atomic_ribbons(painter, center, radius, foreground=True)
             self._draw_atomic_particles(painter, center, radius, foreground=True)
+            self._draw_voice_rings(painter, center, radius)
+            self._draw_state_accent(painter, center, radius)
+            self._draw_cinematic_text(painter, center, radius)
 
         def _draw_starfield(self, painter: QPainter, width: float, height: float) -> None:
             primary = QColor(_GLASS_PRIMARY)
@@ -679,6 +682,16 @@ else:
                 mesh_radius * 2.0,
                 mesh_radius * 2.0,
             )
+            # A narrow complete plasma corona keeps the fallback volume
+            # readable at every angle. Broken white-hot fragments are layered
+            # over it below, so it still feels electrical rather than like a
+            # smooth glass outline.
+            corona = QColor(primary)
+            corona.setAlpha(round(178 * energy))
+            corona_pen = QPen(corona, 1.05)
+            corona_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(corona_pen)
+            painter.drawEllipse(boundary)
             edge = QColor(primary)
             edge.setAlpha(round(74 * energy))
             edge_pen = QPen(edge, 0.8)
@@ -857,7 +870,7 @@ else:
         ) -> None:
             """Wrap the atom in several broken particle belts and loose sparks."""
 
-            if self._animation_intensity <= 0.0:
+            if self._animation_intensity <= 0.0 or self._visual.particles <= 0:
                 return
             activity = self._render_activity()
             energy = self._cinematic_energy()

@@ -266,10 +266,16 @@ class CinematicOrbContractTests(unittest.TestCase):
             centre = blue.pixelColor(350, 350)
             self.assertGreater(sum(centre.getRgb()[:3]) / 3.0, 175.0)
 
-            # Sample the strongest pixel through a narrow shell band for each
-            # angle. Turbulence moves the rim locally, but it must remain a
-            # continuous bright corona rather than a thin decorative outline.
-            shell_radius = 700.0 * 0.320 * blue_orb.current_visual_scale()
+            # The fallback's narrow plasma corona follows the actual frozen
+            # cinematic geometry: a 0.345 canvas radius with the mesh at 82%.
+            # Sample through a small turbulence band without weakening the
+            # brightness contract now that WebGL is the primary renderer.
+            shell_radius = (
+                700.0
+                * 0.345
+                * 0.82
+                * blue_orb.current_visual_scale()
+            )
             shell_values = []
             for degree in range(0, 360, 3):
                 angle = math.radians(degree)

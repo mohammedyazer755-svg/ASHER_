@@ -227,15 +227,15 @@ class QtSmokeTests(unittest.TestCase):
         )
         with patch.object(controller, "status", return_value=listening):
             window._refresh_status()
-        self.app.processEvents()
-        self.assertAlmostEqual(window.home.orb._audio_level, 0.37)
-        # The visible Companion orb may consume one presentation-decay tick
-        # while processEvents() paints it; the real sample must remain present
-        # and bounded, not equal an animation-frame-dependent exact value.
-        self.assertGreater(window.companion_mode.orb._audio_level, 0.0)
-        self.assertLessEqual(window.companion_mode.orb._audio_level, 0.37)
-        self.assertFalse(window.home.orb.isVisible())
-        self.assertFalse(window.home.orb._timer.isActive())
+            self.app.processEvents()
+            self.assertAlmostEqual(window.home.orb._audio_level, 0.37)
+            # The visible Companion orb may consume one presentation-decay tick
+            # while processEvents() paints it; the real sample must remain present
+            # and bounded, not equal an animation-frame-dependent exact value.
+            self.assertGreater(window.companion_mode.orb._audio_level, 0.0)
+            self.assertLessEqual(window.companion_mode.orb._audio_level, 0.37)
+            self.assertFalse(window.home.orb.isVisible())
+            self.assertFalse(window.home.orb._timer.isActive())
 
         # A speaking state never manufactures amplitude: without active real
         # microphone input, even a stale/non-zero scalar is forced to zero.

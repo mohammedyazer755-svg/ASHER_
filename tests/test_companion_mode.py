@@ -268,6 +268,8 @@ class CompanionMinimalUiContractTests(unittest.TestCase):
         from asher.ui.controller import PendingAction
         from asher.ui.window import AsherMainWindow
 
+        from PySide6.QtWidgets import QSizePolicy
+
         window = AsherMainWindow(_controller())
         page = window.companion_mode
         pending = PendingAction(
@@ -291,7 +293,6 @@ class CompanionMinimalUiContractTests(unittest.TestCase):
                     page.resize(width, height)
                     self.app.processEvents()
                     applied = page._fit_orb_to_viewport()
-                    margins = page.root_layout.contentsMargins()
                     top_height = max(
                         page.brand.sizeHint().height(),
                         page.stop_button.sizeHint().height(),
@@ -301,24 +302,22 @@ class CompanionMinimalUiContractTests(unittest.TestCase):
                         if active_pending is not None
                         else 0
                     )
-                    required_height = (
-                        margins.top()
-                        + margins.bottom()
-                        + top_height
-                        + confirmation_height
-                        + 16
-                        + applied
+                    usable_short_edge = min(
+                        width,
+                        max(1, height - top_height - confirmation_height - 24),
                     )
-                    required_width = margins.left() + margins.right() + applied
-                    self.assertGreaterEqual(applied, 340)
-                    self.assertLessEqual(applied, 700)
-                    self.assertLessEqual(required_height, height)
-                    self.assertLessEqual(required_width, width)
-                    self.assertEqual(page.orb.width(), page.orb.height())
-                    if width >= 1920:
-                        self.assertEqual(applied, 700)
-                    # Wheel/gesture hooks cannot enlarge the orb past the
-                    # current live viewport.
-                    self.assertEqual(page.orb.set_display_size(900), applied)
+                    self.assertEqual(applied, usable_short_edge)
+                    self.assertEqual(page.orb.minimumWidth(), 1)
+                    self.assertEqual(page.orb.minimumHeight(), 1)
+                    self.assertGreater(page.orb.maximumWidth(), 900)
+                    self.assertGreater(page.orb.maximumHeight(), 900)
+                    self.assertEqual(
+                        page.orb.sizePolicy().horizontalPolicy(),
+                        QSizePolicy.Policy.Expanding,
+                    )
+                    self.assertEqual(
+                        page.orb.sizePolicy().verticalPolicy(),
+                        QSizePolicy.Policy.Expanding,
+                    )
         window.close()
 
