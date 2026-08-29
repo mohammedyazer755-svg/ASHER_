@@ -197,6 +197,7 @@ else:
             self._minimum_display_size = 340
             self._maximum_display_size = 900
             self._cinematic_mode = False
+            self._transparent_canvas = False
             self._overlay_title = ""
             self._overlay_message = ""
             self._font_family = self._resolve_font_family()
@@ -263,6 +264,14 @@ else:
             """Switch between compact workspace rendering and immersive HUD rendering."""
 
             self._cinematic_mode = bool(enabled)
+            self.update()
+
+        def set_transparent_canvas(self, enabled: bool) -> None:
+            """Let a parent glass surface show through without changing orb geometry."""
+
+            self._transparent_canvas = bool(enabled)
+            self.setAutoFillBackground(False)
+            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
             self.update()
 
         def set_overlay_text(self, title: str, message: str = "") -> None:
@@ -516,7 +525,8 @@ else:
             )
             base_radius = extent * 0.270
             radius = base_radius * compact_scale * (1.0 + breath)
-            painter.fillRect(self.rect(), QColor(_GLASS_BACKGROUND))
+            if not self._transparent_canvas:
+                painter.fillRect(self.rect(), QColor(_GLASS_BACKGROUND))
             self._draw_ambient_glow(painter, center, radius)
             self._draw_particles(painter, center, radius)
             self._draw_orbits(painter, center, radius)
@@ -532,7 +542,8 @@ else:
         ) -> None:
             """Render an open atomic-energy form inspired by the owner reference."""
 
-            painter.fillRect(self.rect(), QColor("#02050B"))
+            if not self._transparent_canvas:
+                painter.fillRect(self.rect(), QColor("#02050B"))
             self._draw_atomic_ambient(painter, center, radius)
             self._draw_atomic_particles(painter, center, radius, foreground=False)
             self._draw_atomic_ribbons(painter, center, radius, foreground=False)

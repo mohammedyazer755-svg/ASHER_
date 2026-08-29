@@ -67,3 +67,14 @@ android/**/build/
 # OS files
 .DS_Store
 Thumbs.db
+
+# One-off UI migration / recovery scripts
+ASHER_UI5*.py
+
+# Temporary test failure dumps
+full_suite_current_fail.txt
+ui5c*.txt
+
+# Abandoned placeholder 3D avatar assets
+asher/ui/home_companion/assets/male_asher.glb
+asher/ui/home_companion/assets/female_asher.glb

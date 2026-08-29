@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>ASHER Home Companion</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent !important;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #companion-canvas-container {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: auto;
+      cursor: grab;
+      background: transparent !important;
+    }
+    #companion-canvas-container.dragging {
+      cursor: grabbing;
+    }
+    canvas {
+      width: 100% !important;
+      height: 100% !important;
+      display: block;
+      outline: none;
+      background: transparent !important;
+    }
+  </style>
+
+  <!-- Local Import Map for Three.js, Addons, and three-vrm -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three/three.module.min.js",
+        "three/addons/": "./vendor/three/addons/",
+        "@pixiv/three-vrm": "./vendor/three-vrm/three-vrm.module.min.js"
+      }
+    }
+  </script>
+
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="bridge.js"></script>
+</head>
+<body>
+  <div id="companion-canvas-container"></div>
+  <script type="module" src="companion_scene.js"></script>
+</body>
+</html>

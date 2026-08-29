@@ -337,17 +337,32 @@ else:
             self._minimum_display_size = 340
             self._maximum_display_size = 900
             self._web_ready = False
+            self._renderer_failed = False
             self._renderer_error = ""
             self._shutdown = False
             self._web_supported = web_orb_available()
 
             self._layout = QStackedLayout(self)
             self._layout.setContentsMargins(0, 0, 0, 0)
+
+            # Startup is intentionally visually neutral. The legacy QPainter
+            # orb is reserved for a genuine WebGL failure, so it can never flash
+            # before the exact local Three.js renderer becomes ready.
+            self._startup_surface = QWidget(self)
+            self._startup_surface.setAttribute(
+                Qt.WidgetAttribute.WA_StyledBackground,
+                True,
+            )
+            self._startup_surface.setStyleSheet(
+                "background: #02050b; border: 0;"
+            )
+            self._layout.addWidget(self._startup_surface)
+
             self._fallback = AsherOrbWidget(self)
             self._fallback.set_cinematic_mode(True)
             self._fallback.set_interactive_resize(False)
             self._layout.addWidget(self._fallback)
-            self._layout.setCurrentWidget(self._fallback)
+            self._layout.setCurrentWidget(self._startup_surface)
 
             self.bridge = WebOrbBridge(self)
             self.bridge.rendererReadySignal.connect(self._activate_webgl)
@@ -380,15 +395,42 @@ else:
 
         @property
         def fallback_active(self) -> bool:
-            return self._layout.currentWidget() is self._fallback
+            """Preserve the legacy non-WebGL contract during safe startup/failure."""
+
+            current = self._layout.currentWidget()
+            return current is self._startup_surface or current is self._fallback
 
         @property
         def renderer_error(self) -> str:
             return self._renderer_error
 
         @property
+        def presentation_ready(self) -> bool:
+            """Return True once Companion can switch without exposing startup fallback."""
+
+            return bool(
+                self._web_ready
+                or self._renderer_failed
+                or not self._web_supported
+            )
+
+        @property
         def gestures_available(self) -> bool:
             return bool(self._web_ready and self._view is not None)
+
+        def prewarm(self) -> bool:
+            """Start the sealed local WebGL renderer while Companion is still hidden."""
+
+            if self._shutdown or not self._web_supported:
+                return self.presentation_ready
+            if self._view is None:
+                try:
+                    self._create_web_view()
+                except Exception as error:
+                    self._activate_fallback(
+                        f"Local WebGL startup failed: {type(error).__name__}"
+                    )
+            return self._web_ready
 
         def _create_web_view(self) -> None:
             self._profile = QWebEngineProfile(self)
@@ -445,6 +487,7 @@ else:
             if self._shutdown or self._view is None:
                 return
             self._web_ready = True
+            self._renderer_failed = False
             self._renderer_error = ""
             self._layout.setCurrentWidget(self._view)
             self._fallback.set_audio_level(0.0)
@@ -453,6 +496,7 @@ else:
 
         def _activate_fallback(self, reason: str = "") -> None:
             self._web_ready = False
+            self._renderer_failed = True
             self._renderer_error = str(reason or "WebGL renderer unavailable")[:500]
             self._gesture_enabled = False
             self.bridge.set_gesture_enabled(False)
@@ -575,8 +619,7 @@ else:
             super().showEvent(event)
             self._active = True
             self.bridge.set_active(True)
-            if self._web_supported and self._view is None:
-                self._create_web_view()
+            self.prewarm()
 
         def hideEvent(self, event: Any) -> None:  # noqa: N802
             self._active = False

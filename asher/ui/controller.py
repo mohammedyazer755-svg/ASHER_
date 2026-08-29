@@ -130,6 +130,7 @@ class DesktopSettings:
     offline_only: bool = True
     api_enabled: bool = False
     microphone_index: int | None = None
+    companion_appearance: str = "male"
 
 
 @dataclass(frozen=True, slots=True)
@@ -608,11 +609,17 @@ class DesktopController:
             "offline_only",
             "api_enabled",
             "microphone_index",
+            "companion_appearance",
         }
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError(f"Unknown setting: {sorted(unknown)[0]}")
         with self._lock:
+            if "companion_appearance" in changes:
+                app_val = str(changes["companion_appearance"]).lower()
+                if app_val not in {"male", "female"}:
+                    raise ValueError(f"Invalid companion appearance: {changes['companion_appearance']}")
+                changes["companion_appearance"] = app_val
             updated = replace(self._settings, **changes)
             selected = self._tts.registry.get(updated.voice_profile)
             if updated.offline_only and selected.provider != "sapi":
