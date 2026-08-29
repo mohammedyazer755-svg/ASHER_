@@ -6,6 +6,12 @@
   <img src="docs/assets/asher-workspace.png" width="100%" alt="ASHER Workspace">
 </p>
 
+## Demo
+
+▶ [Watch the ASHER demo](docs/assets/asher-demo.mp4)
+
+The demo shows ASHER transitioning from the Workspace into Companion Mode during live voice interaction.
+
 ASHER is an experimental desktop AI agent built around natural voice interaction, local inference, controlled system actions, and a cinematic companion interface.
 
 Rather than functioning only as a chatbot, ASHER is being designed as a persistent desktop companion that can listen, reason, interact with Windows, and respond through voice while keeping core processing and personal data local.
