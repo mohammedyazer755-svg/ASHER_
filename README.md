@@ -8,7 +8,11 @@
 
 ## Demo
 
-▶ [Watch the ASHER demo](docs/assets/asher-demo.mp4)
+<p align="center">
+  <img src="docs/assets/asher-demo-preview.gif" width="100%" alt="ASHER Demo Preview">
+</p>
+
+▶ **[Watch the full ASHER demo](docs/assets/asher-demo.mp4)**
 
 The demo shows ASHER transitioning from the Workspace into Companion Mode during live voice interaction.
 
