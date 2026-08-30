@@ -636,11 +636,32 @@ else:
             self._gesture_enabled = False
             self.bridge.set_active(False)
             if self._view is not None:
-                self._view.page().runJavaScript(
-                    "window.asherOrbShutdown && window.asherOrbShutdown();"
-                )
-                self._view.stop()
+                try:
+                    self._view.page().runJavaScript(
+                        "window.asherOrbShutdown && window.asherOrbShutdown();"
+                    )
+                    self._view.stop()
+                except Exception:
+                    pass
+                if self._page is not None:
+                    try:
+                        self._page.setWebChannel(None)
+                    except Exception:
+                        pass
+                page = self._page or self._view.page()
+                try:
+                    self._view.setPage(None)
+                except Exception:
+                    pass
+                if page is not None:
+                    page.deleteLater()
                 self._view.close()
+                self._view.deleteLater()
+                self._view = None
+                self._page = None
+            if hasattr(self, "_profile") and self._profile is not None:
+                self._profile.deleteLater()
+                self._profile = None
 
         def closeEvent(self, event: Any) -> None:  # noqa: N802
             self.shutdown()

@@ -120,6 +120,21 @@ class PreferenceCoreTests(unittest.TestCase):
             self.assertNotIn(event.user_text, audit_text)
             self.assertNotIn(event.assistant_text, audit_text)
 
+    def test_candidate_generated_while_disabled_cannot_be_labeled_after_enabling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            session = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            self.assertFalse(controller.preference_learning_enabled)
+
+            controller.handle_text("open chrome", session)
+
+            controller.handle_text("preference learning on", session)
+            self.assertTrue(controller.preference_learning_enabled)
+
+            with self.assertRaises(LookupError):
+                controller.handle_text("feedback shorter", session)
+            self.assertEqual(controller.list_preference_events(session), ())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -121,6 +121,50 @@ class AgentIntegrationTests(unittest.TestCase):
             for prohibited in ("diagnosis", "disorder", "definitely feel", "depend on me"):
                 self.assertNotIn(prohibited, lowered)
 
+    def test_search_follow_up_resolves_prior_topic_within_session_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            session1 = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            reply1 = controller.handle_text("search YOLO pose estimation", session1)
+            search1 = [
+                u.result.evidence[0].data
+                for u in reply1.updates
+                if u.result and u.result.tool_name == "browser.search"
+            ]
+            self.assertEqual(len(search1), 1)
+            self.assertEqual(search1[0]["query"], "YOLO pose estimation")
+            self.assertEqual(search1[0]["engine"], "google")
+
+            reply2 = controller.handle_text("Search that on YouTube", session1)
+            search2 = [
+                u.result.evidence[0].data
+                for u in reply2.updates
+                if u.result and u.result.tool_name == "browser.search"
+            ]
+            self.assertEqual(len(search2), 1)
+            self.assertEqual(search2[0]["query"], "YOLO pose estimation")
+            self.assertEqual(search2[0]["engine"], "youtube")
+
+            session2 = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            reply_isolated = controller.handle_text("Search that on YouTube", session2)
+            self.assertIn("Which search topic", reply_isolated.text)
+            self.assertEqual(
+                [u for u in reply_isolated.updates if u.result and u.result.tool_name == "browser.search"],
+                [],
+            )
+
+    def test_no_tool_replies_appended_to_working_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._controller(directory)
+            session = controller.create_owner_session(AuthMethod.LOCAL_UI)
+            reply = controller.handle_text("hello", session)
+            turns = controller.working_memory.recent(session.session_id)
+            self.assertEqual(len(turns), 2)
+            self.assertEqual(turns[0].role, "user")
+            self.assertEqual(turns[0].text, "hello")
+            self.assertEqual(turns[1].role, "assistant")
+            self.assertEqual(turns[1].text, reply.text)
+
 
 if __name__ == "__main__":
     unittest.main()

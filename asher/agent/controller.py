@@ -152,6 +152,9 @@ class CompanionController:
         if active.actor.role is not Role.OWNER or active.actor.user_id != self.owner.user_id:
             raise PermissionError("Only the owner can configure PreferenceCore")
         self.preference_store.configure(enabled=enabled)
+        if not enabled:
+            with self._preference_lock:
+                self._preference_candidates.clear()
         self.audit.append(
             "preference_learning_setting",
             actor_id=active.actor.user_id,
@@ -211,7 +214,11 @@ class CompanionController:
         # Safety/confirmation copy is not a trainable style target. PreferenceCore
         # may change presentation style later, but it must never learn to weaken
         # required previews or local policy messages.
-        if confirmation_required or provider in {"local-safety", "local-policy"}:
+        if (
+            not self.preference_learning_enabled
+            or confirmation_required
+            or provider in {"local-safety", "local-policy"}
+        ):
             with self._preference_lock:
                 self._preference_candidates.pop(session.session_id, None)
             return
@@ -417,10 +424,13 @@ class CompanionController:
         # unrelated contact/app names out of remote provider prompts.
         last_contact = continuation.get("last_contact", "")
         last_app = continuation.get("last_app", "")
+        last_search_query = continuation.get("last_search_query", "")
         if last_contact and any(token in lowered for token in ("him", "her", "them", "same person", "that contact")):
             context["last_contact"] = last_contact
         if last_app and any(token in lowered for token in ("it", "that window", "same app", "close it")):
             context["last_app"] = last_app
+        if last_search_query and any(token in lowered for token in ("that", "it", "the same", "same topic", "previous topic", "same thing", "previous search")):
+            context["last_search_query"] = last_search_query
         self.working_memory.append(session.session_id, "user", redact_text(text))
         self.loop.states.transition(
             AssistantState.THINKING,
@@ -473,6 +483,7 @@ class CompanionController:
             return CompanionReply(response, offline=plan.offline, provider=plan.provider)
         if not plan.steps:
             response = plan.response or "I’m not sure how to help with that yet."
+            self.working_memory.append(session.session_id, "assistant", redact_text(response))
             self.loop.states.transition(
                 AssistantState.SUCCESS,
                 "Response ready",
@@ -616,6 +627,9 @@ class CompanionController:
                     value = str(evidence.data.get("contact", "")).strip()
                     if value:
                         changed["last_contact"] = value
+                query_val = str(evidence.data.get("query", "")).strip()
+                if query_val:
+                    changed["last_search_query"] = query_val
         if changed:
             with self._context_lock:
                 self._session_context.setdefault(session.session_id, {}).update(changed)

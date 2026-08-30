@@ -323,6 +323,9 @@ class FileVoiceGuardVerifier:
                 return None, 0.0, "VoiceGuard enrollment or active model changed; guest access only"
             user_id = self.label_to_user.get(result.predicted_label) if result.accepted else None
             return user_id, result.score, result.reason
+        except Exception as exc:
+            self._model = None
+            return None, 0.0, f"VoiceGuard verification error: {exc}"
         finally:
             path.unlink(missing_ok=True)
 
@@ -1072,10 +1075,15 @@ class VoiceRuntime:
         score = None
         reason = "VoiceGuard not enrolled; guest session"
         if self.voiceguard is not None:
-            owner_id, score, reason = self.voiceguard.authenticate(
-                turn.pcm16,
-                turn.sample_rate,
-            )
+            try:
+                owner_id, score, reason = self.voiceguard.authenticate(
+                    turn.pcm16,
+                    turn.sample_rate,
+                )
+            except Exception as exc:
+                owner_id = None
+                score = 0.0
+                reason = f"VoiceGuard verification error: {exc}"
         actor = self.controller.users.get(owner_id) if owner_id else None
         if actor is not None and actor.role.value in {"owner", "trusted"}:
             session = self.controller.create_voice_session(actor)

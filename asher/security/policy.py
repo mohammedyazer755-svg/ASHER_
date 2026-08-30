@@ -62,8 +62,16 @@ class PolicyEngine:
         if actor.role is Role.GUEST:
             return PolicyDecision(DecisionKind.DENY, "Guests cannot access private data or tools")
 
-        if actor.role is Role.TRUSTED and policy.capability not in actor.permissions:
-            return PolicyDecision(DecisionKind.DENY, "This capability was not granted to the trusted user")
+        if actor.role is Role.TRUSTED:
+            aliases = {
+                "private_memory": {"private_memory", "memory.read"},
+                "private_memory_write": {"private_memory_write", "memory.write"},
+                "memory.read": {"private_memory", "memory.read"},
+                "memory.write": {"private_memory_write", "memory.write"},
+            }
+            allowed = aliases.get(policy.capability, {policy.capability})
+            if not any(perm in actor.permissions for perm in allowed):
+                return PolicyDecision(DecisionKind.DENY, "This capability was not granted to the trusted user")
 
         if policy.risk is RiskLevel.HARMLESS_LOCAL:
             if session.auth_method in {AuthMethod.VOICE, AuthMethod.LOCAL_UI, AuthMethod.DEVICE_CREDENTIAL}:

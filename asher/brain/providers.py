@@ -196,6 +196,7 @@ class HybridPlanner:
             command,
             last_app=str(context.get("last_app", "")),
             last_contact=str(context.get("last_contact", "")),
+            last_search_query=str(context.get("last_search_query", "")),
         )
         if deterministic is not None:
             self.last_provider = "deterministic"

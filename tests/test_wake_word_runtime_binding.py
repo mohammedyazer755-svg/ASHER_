@@ -659,6 +659,56 @@ class WakeWordRuntimeBindingTests(unittest.TestCase):
             self.assertTrue(accepted)
             self.assertIsNone(score)
 
+    def test_voiceguard_verifier_exception_fails_safe_to_guest_without_crashing_runtime(self) -> None:
+        class _CrashingSpeakerVerifier:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def authenticate(self, _pcm16: bytes, _sample_rate: int):
+                self.calls += 1
+                raise RuntimeError("Injected biometric pipeline fault")
+
+        wake = _WakeVerifier(True)
+        speaker = _CrashingSpeakerVerifier()
+        with TemporaryDirectory() as directory:
+            controller, events = _run_one_turn(
+                directory,
+                "open chrome",
+                WakeWordModelBinding(True, verifier=wake),
+                speaker,
+                turn_count=2,
+            )
+
+        self.assertEqual(speaker.calls, 1)
+        self.assertEqual(controller.transcriber_calls, 1)
+        self.assertEqual(len(controller.commands), 1)
+        command, session = controller.commands[0]
+        self.assertEqual(command, "open chrome")
+        self.assertIsNone(session.actor, "Session must fail-safe to guest when VoiceGuard throws")
+        kinds = [event.kind for event in events]
+        self.assertIn("guest", kinds)
+        self.assertNotIn("authenticated", kinds)
+
+    def test_file_voiceguard_verifier_verify_wav_exception_fails_safe(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_root = Path(directory)
+            _trained_manager(runtime_root)
+            controller = _controller(runtime_root)
+            speaker = load_active_voiceguard_verifier(controller)
+            self.assertIsNotNone(speaker)
+
+            class _CrashingExtractor:
+                metadata = getattr(speaker.extractor, "metadata", None)
+
+                def extract_wav(self, _path):
+                    raise RuntimeError("Extractor audio corruption")
+
+            speaker.extractor = _CrashingExtractor()
+            user_id, score, reason = speaker.authenticate(b"\0\0" * 40, 16_000)
+            self.assertIsNone(user_id)
+            self.assertEqual(score, 0.0)
+            self.assertIn("VoiceGuard verification error", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

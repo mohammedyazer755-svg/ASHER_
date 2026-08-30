@@ -251,6 +251,115 @@ class SecurityTests(unittest.TestCase):
         self.assertFalse(stop.reset(local_ui_confirmed=False))
         self.assertTrue(stop.reset(local_ui_confirmed=True))
 
+    def test_financial_or_security_policy_matrix(self) -> None:
+        from asher.types import Confirmation
+
+        policy_engine = PolicyEngine()
+        financial_policy = ToolPolicy("bank.transfer", RiskLevel.FINANCIAL_OR_SECURITY)
+        owner = Actor("owner-1", "Owner", Role.OWNER)
+        trusted = Actor("trusted-1", "Trusted", Role.TRUSTED, permissions=("bank.transfer",))
+        guest = Actor("guest-1", "Guest", Role.GUEST)
+
+        manager = SessionManager(ttl_minutes=5)
+        owner_session = manager.create(owner, AuthMethod.LOCAL_UI)
+        trusted_session = manager.create(trusted, AuthMethod.LOCAL_UI)
+        guest_session = manager.create(guest, AuthMethod.NONE)
+
+        # 1. Guest is denied
+        d_guest = policy_engine.evaluate(financial_policy, guest_session)
+        self.assertEqual(d_guest.kind, DecisionKind.DENY)
+
+        # 2. Trusted user is denied even with permission
+        d_trusted = policy_engine.evaluate(financial_policy, trusted_session)
+        self.assertEqual(d_trusted.kind, DecisionKind.DENY)
+
+        # 3. Owner without confirmation requires strong auth
+        d_owner_unconfirmed = policy_engine.evaluate(financial_policy, owner_session)
+        self.assertEqual(d_owner_unconfirmed.kind, DecisionKind.REQUIRE_STRONG_AUTH)
+
+        # 4. Owner with unapproved confirmation requires strong auth
+        expires = utc_now() + timedelta(minutes=2)
+        unapproved = Confirmation(
+            confirmation_id="c1",
+            tool_name="bank.transfer",
+            target="target",
+            effect="effect",
+            preview={},
+            risk=RiskLevel.FINANCIAL_OR_SECURITY,
+            expires_at=expires,
+            session_id=owner_session.session_id,
+            actor_id=owner.user_id,
+            approved=False,
+        )
+        d_owner_unapproved = policy_engine.evaluate(financial_policy, owner_session, unapproved)
+        self.assertEqual(d_owner_unapproved.kind, DecisionKind.REQUIRE_STRONG_AUTH)
+
+        # 5. Owner with VOICE approval is denied
+        voice_approved = Confirmation(
+            confirmation_id="c2",
+            tool_name="bank.transfer",
+            target="target",
+            effect="effect",
+            preview={},
+            risk=RiskLevel.FINANCIAL_OR_SECURITY,
+            expires_at=expires,
+            session_id=owner_session.session_id,
+            actor_id=owner.user_id,
+            approved=True,
+            method=AuthMethod.VOICE,
+        )
+        d_owner_voice = policy_engine.evaluate(financial_policy, owner_session, voice_approved)
+        self.assertEqual(d_owner_voice.kind, DecisionKind.DENY)
+
+        # 6. Owner with standard LOCAL_UI approval still requires DEVICE_CREDENTIAL
+        local_approved = Confirmation(
+            confirmation_id="c3",
+            tool_name="bank.transfer",
+            target="target",
+            effect="effect",
+            preview={},
+            risk=RiskLevel.FINANCIAL_OR_SECURITY,
+            expires_at=expires,
+            session_id=owner_session.session_id,
+            actor_id=owner.user_id,
+            approved=True,
+            method=AuthMethod.LOCAL_UI,
+        )
+        d_owner_local = policy_engine.evaluate(financial_policy, owner_session, local_approved)
+        self.assertEqual(d_owner_local.kind, DecisionKind.REQUIRE_STRONG_AUTH)
+
+        # 7. Owner with DEVICE_CREDENTIAL approval is allowed
+        device_approved = Confirmation(
+            confirmation_id="c4",
+            tool_name="bank.transfer",
+            target="target",
+            effect="effect",
+            preview={},
+            risk=RiskLevel.FINANCIAL_OR_SECURITY,
+            expires_at=expires,
+            session_id=owner_session.session_id,
+            actor_id=owner.user_id,
+            approved=True,
+            method=AuthMethod.DEVICE_CREDENTIAL,
+        )
+        d_owner_device = policy_engine.evaluate(financial_policy, owner_session, device_approved)
+        self.assertEqual(d_owner_device.kind, DecisionKind.ALLOW)
+
+    def test_trusted_memory_capability_aliases(self) -> None:
+        policy_engine = PolicyEngine()
+        read_policy = ToolPolicy("private_memory", RiskLevel.HARMLESS_LOCAL)
+        write_policy = ToolPolicy("private_memory_write", RiskLevel.SENSITIVE)
+
+        trusted_read = Actor("t1", "Trusted Read", Role.TRUSTED, permissions=("memory.read",))
+        session_read = SessionManager().create(trusted_read, AuthMethod.LOCAL_UI)
+        d_read = policy_engine.evaluate(read_policy, session_read)
+        self.assertEqual(d_read.kind, DecisionKind.ALLOW)
+
+        trusted_write = Actor("t2", "Trusted Write", Role.TRUSTED, permissions=("private_memory_write",))
+        session_write = SessionManager().create(trusted_write, AuthMethod.LOCAL_UI)
+        d_write_unconf = policy_engine.evaluate(write_policy, session_write)
+        self.assertEqual(d_write_unconf.kind, DecisionKind.REQUIRE_STRONG_AUTH)
+
 
 if __name__ == "__main__":
     unittest.main()

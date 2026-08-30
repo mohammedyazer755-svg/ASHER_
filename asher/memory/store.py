@@ -131,7 +131,16 @@ class MemoryStore:
     def _can_access(requester: Actor, owner_id: str, capability: str) -> bool:
         if requester.role is Role.OWNER and requester.user_id == owner_id:
             return True
-        return requester.role is Role.TRUSTED and capability in requester.permissions
+        if requester.role is not Role.TRUSTED:
+            return False
+        if capability in requester.permissions:
+            return True
+        aliases = {
+            "memory.read": {"private_memory", "memory.read"},
+            "memory.write": {"private_memory_write", "memory.write"},
+        }
+        allowed = aliases.get(capability, {capability})
+        return any(perm in requester.permissions for perm in allowed)
 
     @staticmethod
     def _from_row(row: Any) -> MemoryRecord:

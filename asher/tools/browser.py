@@ -58,7 +58,13 @@ class BrowserTools:
             if engine == "youtube"
             else f"https://www.google.com/search?q={encoded}"
         )
-        return self._open(url, context, f"Searching {engine.title()} for {query}.")
+        return self._open(
+            url,
+            context,
+            f"Searching {engine.title()} for {query}.",
+            query=query,
+            engine=engine,
+        )
 
     def navigate(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         url = arguments["url"].strip()
@@ -69,12 +75,26 @@ class BrowserTools:
             return _failure(context, "credentials_in_url", "URLs containing credentials are not allowed.")
         return self._open(url, context, f"Opened {parsed.netloc}.")
 
-    def _open(self, url: str, context: ToolContext, message: str) -> ToolResult:
+    def _open(
+        self,
+        url: str,
+        context: ToolContext,
+        message: str,
+        *,
+        query: str | None = None,
+        engine: str | None = None,
+    ) -> ToolResult:
+        evidence_data: dict[str, Any] = {"url": url}
+        if query:
+            evidence_data["query"] = query
+        if engine:
+            evidence_data["engine"] = engine
         if context.dry_run:
             return successful_result(
-                context.metadata["call_id"], context.metadata["tool_name"],
+                context.metadata["call_id"],
+                context.metadata["tool_name"],
                 f"Dry run verified browser navigation to {url}.",
-                (Evidence("dry_run", "No browser navigation occurred", {"url": url}),),
+                (Evidence("dry_run", "No browser navigation occurred", evidence_data),),
                 dry_run=True,
             )
         before = {handle for handle, _ in visible_windows()}
@@ -98,9 +118,12 @@ class BrowserTools:
             time.sleep(0.2)
         if not observed:
             return _failure(context, "unverified_navigation", "The URL was dispatched, but no browser window was observed.")
+        evidence_data["window_title"] = observed[1]
         return successful_result(
-            context.metadata["call_id"], context.metadata["tool_name"], message,
-            (Evidence("browser_window_observed", "A browser window was visible after navigation", {"window_title": observed[1], "url": url}),),
+            context.metadata["call_id"],
+            context.metadata["tool_name"],
+            message,
+            (Evidence("browser_window_observed", "A browser window was visible after navigation", evidence_data),),
         )
 
 

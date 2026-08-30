@@ -64,7 +64,14 @@ class DeterministicPlanner:
     def __init__(self, resolver: ContactResolver | None = None) -> None:
         self.resolver = resolver or ContactResolver()
 
-    def plan(self, command: str, *, last_app: str = "", last_contact: str = "") -> ProposedPlan | None:
+    def plan(
+        self,
+        command: str,
+        *,
+        last_app: str = "",
+        last_contact: str = "",
+        last_search_query: str = "",
+    ) -> ProposedPlan | None:
         original = command.strip()
         lowered = original.casefold().strip().rstrip(".,!?;:")
         if not lowered:
@@ -74,12 +81,45 @@ class DeterministicPlanner:
         if lowered in {"emergency stop", "stop everything", "asher emergency stop"}:
             return ProposedPlan(goal=original, response="Emergency stop requested.")
 
-        compound = self._compound(lowered, original, last_app=last_app, last_contact=last_contact)
+        search_follow_up = re.match(
+            r"^(?:(?:search|look\s+up)\s+(?:that|it|the\s+same(?:\s+(?:thing|topic|query))?)|look\s+(?:that|it)\s+up)\s+(?:on|in)\s+(youtube|google)$|"
+            r"^(?:search|look\s+up)\s+(?:on\s+)?(youtube|google)\s+(?:for\s+)?(?:that|it|the\s+same(?:\s+(?:thing|topic|query))?)$|"
+            r"^(youtube|google)\s+(?:that|it|the\s+same(?:\s+(?:thing|topic|query))?)$",
+            lowered,
+        )
+        if search_follow_up:
+            engine = (search_follow_up.group(1) or search_follow_up.group(2) or search_follow_up.group(3) or "google").casefold()
+            if not last_search_query.strip():
+                return ProposedPlan(
+                    original,
+                    (),
+                    "Which search topic would you like me to use?",
+                )
+            return ProposedPlan(
+                original,
+                (
+                    _step(
+                        "browser.search",
+                        {"query": last_search_query.strip(), "engine": engine},
+                        f"Search {engine.title()} for the previous topic",
+                    ),
+                ),
+            )
+
+        compound = self._compound(
+            lowered,
+            original,
+            last_app=last_app,
+            last_contact=last_contact,
+            last_search_query=last_search_query,
+        )
         if compound is not None:
             return compound
 
         patterns: tuple[tuple[re.Pattern[str], Callable[[re.Match[str], str], ProposedPlan]], ...] = (
-            (re.compile(r"^(?:what is my|what's my|do you remember)\s+(.+)$"), lambda m, _: ProposedPlan(original, (_step("memory.search", {"query": m.group(1).strip()}, "Search relevant private memory"),))),
+            (re.compile(r"^(?:remember that|remember:|remember)\s+(.+?)\s+(?:is|=|:)\s+(.+)$"), lambda m, _: ProposedPlan(original, (_step("memory.put", {"memory_type": "user_preference", "key": m.group(1).strip(), "value": m.group(2).strip(), "sensitivity": "normal"}, f"Save memory for {m.group(1).strip()}"),))),
+            (re.compile(r"^(?:what is my|what's my|do you remember|recall|search memory for|find in memory)\s+(.+)$"), lambda m, _: ProposedPlan(original, (_step("memory.search", {"query": m.group(1).strip()}, "Search relevant private memory"),))),
+            (re.compile(r"^(?:delete memory|forget memory|remove memory)\s+(?:id\s+)?([a-f0-9\-]+)$"), lambda m, _: ProposedPlan(original, (_step("memory.delete", {"memory_id": m.group(1).strip()}, f"Delete memory {m.group(1).strip()}"),))),
             (re.compile(r"^(?:open|launch|start)\s+(.+)$"), lambda m, _: ProposedPlan(original, (_step("app.open", {"app_name": m.group(1).strip()}, f"Open {m.group(1).strip()}"),))),
             (re.compile(r"^(?:close|quit|exit)\s+(.+)$"), lambda m, _: ProposedPlan(original, (_step("app.close", {"app_name": m.group(1).strip()}, f"Close {m.group(1).strip()}"),))),
             (re.compile(r"^(?:search google for|google search for|search for|look up|google)\s+(.+)$"), lambda m, _: ProposedPlan(original, (_step("browser.search", {"query": m.group(1).strip(), "engine": "google"}, "Search Google"),))),
@@ -170,7 +210,15 @@ class DeterministicPlanner:
             ),
         )
 
-    def _compound(self, lowered: str, original: str, *, last_app: str, last_contact: str) -> ProposedPlan | None:
+    def _compound(
+        self,
+        lowered: str,
+        original: str,
+        *,
+        last_app: str,
+        last_contact: str,
+        last_search_query: str,
+    ) -> ProposedPlan | None:
         # Split only on command connectors, retaining payload punctuation.
         if not any(token in lowered for token in (" and ", ",", " then ", " after that ")):
             return None
@@ -180,7 +228,12 @@ class DeterministicPlanner:
         steps: list[PlanStep] = []
         responses: list[str] = []
         for piece in pieces:
-            plan = self.plan(piece, last_app=last_app, last_contact=last_contact)
+            plan = self.plan(
+                piece,
+                last_app=last_app,
+                last_contact=last_contact,
+                last_search_query=last_search_query,
+            )
             if plan is None or not plan.steps:
                 return None
             steps.extend(plan.steps)
